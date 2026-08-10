@@ -320,12 +320,23 @@ class ExecutionControlTests(unittest.TestCase):
 
 
 class AutomaticStartTests(unittest.TestCase):
-    def make_app(self, auto_start=True):
+    def make_app(self, auto_start=True, pending_changes=()):
         app = DailyGamesApp.__new__(DailyGamesApp)
         app._auto_start_pending = auto_start
+        app._initial_setup_in_progress = False
+        app._initial_setup_resolved = False
+        app._initial_check_results = []
         app.auto_start_logs = []
         app.auto_start_calls = []
         app.wizard_calls = []
+        app.plan_calls = []
+
+        class Controller:
+            def plan_configuration_changes(self, on_done):
+                app.plan_calls.append("plan")
+                on_done(list(pending_changes))
+
+        app.controller = Controller()
         app._append_log = app.auto_start_logs.append
         app._on_start_all = (
             lambda *, auto_exit=False:
@@ -345,6 +356,7 @@ class AutomaticStartTests(unittest.TestCase):
         self.assertEqual(len(app.auto_start_logs), 1)
         self.assertIn("自动开始全部任务", app.auto_start_logs[0])
         self.assertEqual(app.wizard_calls, [])
+        self.assertEqual(app.plan_calls, ["plan"])
 
     def test_failed_initial_check_opens_wizard_and_never_auto_starts(self):
         app = self.make_app()
@@ -355,6 +367,19 @@ class AutomaticStartTests(unittest.TestCase):
         self.assertEqual(app.auto_start_calls, [])
         self.assertEqual(app.wizard_calls, [results])
         self.assertFalse(app._auto_start_pending)
+        self.assertEqual(app.plan_calls, [])
+
+    def test_pending_configuration_change_opens_wizard_before_auto_start(self):
+        pending = [SimpleNamespace(change_id="maa.autorun")]
+        app = self.make_app(pending_changes=pending)
+        results = [SimpleNamespace(ok=True)]
+
+        app._on_initial_check(results)
+
+        self.assertEqual(app.auto_start_calls, [])
+        self.assertEqual(app.wizard_calls, [results])
+        self.assertFalse(app._auto_start_pending)
+        self.assertEqual(app.plan_calls, ["plan"])
 
     def test_regular_gui_keeps_manual_start_behavior(self):
         app = self.make_app(auto_start=False)
@@ -362,6 +387,7 @@ class AutomaticStartTests(unittest.TestCase):
         app._on_initial_check([SimpleNamespace(ok=True)])
 
         self.assertEqual(app.auto_start_calls, [])
+        self.assertEqual(app.plan_calls, ["plan"])
 
 
 class CloseWindowTests(unittest.TestCase):

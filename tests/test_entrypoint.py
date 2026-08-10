@@ -284,6 +284,54 @@ class EntrypointTests(unittest.TestCase):
         self.assertIn("RuntimeError", errors.getvalue())
         popen.assert_not_called()
 
+    def test_repair_paths_runs_without_gui_lock_and_returns_result_status(self):
+        entrypoint = load_entrypoint()
+        calls = []
+        output = io.StringIO()
+
+        exit_code = entrypoint.main(
+            ["--repair-paths"],
+            path_repairer=lambda config_path: (
+                calls.append(config_path)
+                or [Check(
+                    "software_paths.maa",
+                    True,
+                    "software_path_repaired",
+                    "已更新",
+                )]
+            ),
+            gui_runner=lambda config_path: self.fail("位址自查不得运行 GUI"),
+            lock_factory=lambda: self.fail("位址自查不得获取 GUI 锁"),
+            output=output,
+            error_output=io.StringIO(),
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [entrypoint.CONFIG_PATH])
+        self.assertIn("software_paths.maa", output.getvalue())
+        self.assertIn("software_path_repaired", output.getvalue())
+
+    def test_repair_paths_unresolved_candidate_returns_nonzero(self):
+        entrypoint = load_entrypoint()
+        output = io.StringIO()
+
+        exit_code = entrypoint.main(
+            ["--repair-paths"],
+            path_repairer=lambda _config_path: [Check(
+                "software_paths.maa",
+                False,
+                "software_path_ambiguous",
+                "多个候选",
+                "error",
+            )],
+            lock_factory=lambda: self.fail("位址自查不得获取 GUI 锁"),
+            output=output,
+            error_output=io.StringIO(),
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("software_path_ambiguous", output.getvalue())
+
     def test_gui_exception_releases_lock_and_reports_nonzero(self):
         entrypoint = load_entrypoint()
         lock = FakeLock()
@@ -351,6 +399,14 @@ class EntrypointTests(unittest.TestCase):
         self.assertIn("-verb runas", lowered)
         self.assertIn("$repairtasks", lowered)
         self.assertIn("if ($repairtasks)", lowered)
+        self.assertIn("invoke-softwarepathselfcheck", lowered)
+        self.assertIn("--repair-paths", lowered)
+        self.assertIn("& $pythonpath $entrypath '--repair-paths'", lowered)
+        self.assertNotIn("$repairarguments", lowered)
+        self.assertLess(
+            lowered.rfind("invoke-softwarepathselfcheck -pythonwpath"),
+            lowered.rfind("$specs = @(get-admintaskspecs)"),
+        )
         self.assertNotIn("start-scheduledtask", lowered)
         self.assertNotIn("d:\\daily", lowered)
         self.assertNotIn("sendkeys", lowered)
@@ -385,6 +441,17 @@ class EntrypointTests(unittest.TestCase):
         )
 
         self.assertEqual(config["logging"]["level"], "DEBUG")
+        path_check = config["software_path_self_check"]
+        self.assertTrue(path_check["enabled"])
+        self.assertTrue(path_check["auto_repair_unique_match"])
+        self.assertEqual(
+            set(path_check["software_ids"]),
+            {
+                "arknights_game", "maa", "endfield_game",
+                "maaend", "limbus_game", "aalc",
+            },
+        )
+        self.assertNotIn("D:\\", path_check["search_roots"])
         self.assertEqual(
             config["games"]["arknights"]["launcher"]["args"],
             ["--game=b77c220c33d1428bb253d87d88440297", "--reason=4"],

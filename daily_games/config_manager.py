@@ -259,8 +259,8 @@ class ConfigManager:
         },
     )
 
-    # 軟體位址自查只處理可由檔名與伴隨檔案可靠辨識的程式。鷹角啟動器
-    # 的按鈕自動化另有版本與簽章凍結條件，不能只憑路徑候選自動改址。
+    # 软件地址自查只处理可由文件名与伴随文件可靠辨识的程序。鹰角启动器
+    # 的按钮自动化另有版本与签名冻结条件，不能只凭路径候选自动改址。
     _SOFTWARE_PATH_SPECS: tuple[dict[str, object], ...] = (
         {
             "software_id": "arknights_game",
@@ -352,20 +352,20 @@ class ConfigManager:
         return data
 
     # ------------------------------------------------------------------ #
-    # 軟體位址自查                                                        #
+    # 软件地址自查                                                        #
     # ------------------------------------------------------------------ #
 
     def reconcile_software_paths(self, *, apply: bool = False) -> list[CheckResult]:
-        """檢查並在安全條件成立時修復軟體執行檔位址。
+        """检查并在安全条件成立时修复软件程序地址。
 
-        自查由 ``software_path_self_check.enabled`` 明確開啟。既有執行檔與
-        關聯欄位一致時不掃描、不寫入。需要修復時，只在設定的搜尋根目錄內
-        做有限深度搜尋，並以軟體伴隨檔案辨識候選。只有完整掃描得到唯一候選
-        時才允許自動套用；零候選、多候選或掃描不完整一律維持原設定。
+        自查由 ``software_path_self_check.enabled`` 明确开启。现有程序与
+        关联字段一致时不扫描、不写入。需要修复时，只在配置的搜索根目录内
+        做有限深度搜索，并以软件伴随文件辨识候选。只有完整扫描得到唯一候选
+        时才允许自动应用；零候选、多候选或扫描不完整一律保留原配置。
 
-        ``apply=False`` 永遠唯讀，用於 ``preflight`` 與 ``--dry-run``。
-        ``apply=True`` 仍受 ``auto_repair_unique_match`` 控制。套用前會備份
-        ``user.json``，之後以原子替換寫入並重新解析核對全部關聯欄位。
+        ``apply=False`` 永远只读，用于 ``preflight`` 与 ``--dry-run``。
+        ``apply=True`` 仍受 ``auto_repair_unique_match`` 控制。应用前会备份
+        ``user.json``，之后以原子替换写入并重新解析核对全部关联字段。
         """
         cfg = self.load()
         raw_options = cfg.get("software_path_self_check", {})
@@ -385,10 +385,25 @@ class ConfigManager:
         )
         auto_repair = bool(raw_options.get("auto_repair_unique_match", False))
         roots, root_issues = self._software_search_roots(raw_options)
+        raw_software_ids = raw_options.get("software_ids")
+        selected_software_ids = (
+            {
+                str(value)
+                for value in raw_software_ids
+                if isinstance(value, str) and value.strip()
+            }
+            if isinstance(raw_software_ids, (list, tuple))
+            else None
+        )
 
         states: list[dict[str, object]] = []
         filenames_to_scan: set[str] = set()
         for spec in self._SOFTWARE_PATH_SPECS:
+            if (
+                selected_software_ids is not None
+                and str(spec["software_id"]) not in selected_software_ids
+            ):
+                continue
             executable_keys = tuple(spec["executable_path"])  # type: ignore[arg-type]
             configured = _get_nested(cfg, executable_keys)
             current = Path(str(configured)) if isinstance(configured, str) and configured else None
@@ -474,8 +489,8 @@ class ConfigManager:
                     ok=False,
                     code=CODE_SOFTWARE_PATH_NOT_FOUND,
                     message=(
-                        f"{display_name} 位址需要修復，但搜尋未完整完成；"
-                        "為避免選錯程式，已保留原設定"
+                        f"{display_name} 地址需要修复，但搜索未完整完成；"
+                        "为避免选错程序，已保留原配置"
                     ),
                     severity=SEVERITY_ERROR,
                     details=details,
@@ -487,7 +502,7 @@ class ConfigManager:
                     ok=False,
                     code=CODE_SOFTWARE_PATH_NOT_FOUND,
                     message=(
-                        f"找不到可驗證的 {display_name}；請安裝軟體或把安裝目錄"
+                        f"找不到可验证的 {display_name}；请安装软件或把安装目录"
                         "加入 software_path_self_check.search_roots"
                     ),
                     severity=SEVERITY_ERROR,
@@ -500,8 +515,8 @@ class ConfigManager:
                     ok=False,
                     code=CODE_SOFTWARE_PATH_AMBIGUOUS,
                     message=(
-                        f"找到 {len(candidates)} 個可驗證的 {display_name}，"
-                        "無法安全判定應使用哪一個"
+                        f"找到 {len(candidates)} 个可验证的 {display_name}，"
+                        "无法安全判定应使用哪一个"
                     ),
                     severity=SEVERITY_ERROR,
                     details=details,
@@ -520,11 +535,11 @@ class ConfigManager:
                 "changed_fields": changed_fields,
             })
             if not changed_fields:
-                # 這個分支只會出現在掃描與狀態判斷間檔案狀態改變時。
+                # 这个分支只会出现在扫描与状态判断间文件状态改变时。
                 continue
             if not apply or not auto_repair:
                 policy_note = (
-                    "；自動修復目前未啟用"
+                    "；自动修复目前未启用"
                     if apply and not auto_repair
                     else ""
                 )
@@ -533,8 +548,8 @@ class ConfigManager:
                     ok=False,
                     code=CODE_SOFTWARE_PATH_CHANGE_REQUIRED,
                     message=(
-                        f"{display_name} 已找到唯一可信位址 {candidate}，"
-                        f"需要更新 {len(changed_fields)} 個關聯欄位{policy_note}"
+                        f"{display_name} 已找到唯一可信地址 {candidate}，"
+                        f"需要更新 {len(changed_fields)} 个关联字段{policy_note}"
                     ),
                     severity=SEVERITY_WARNING,
                     details=details,
@@ -548,6 +563,25 @@ class ConfigManager:
             })
 
         if not pending:
+            return results
+
+        stale_candidates: list[str] = []
+        for item in pending:
+            spec = item["spec"]
+            candidate = item["candidate"]
+            assert isinstance(spec, Mapping)
+            assert isinstance(candidate, Path)
+            if not self._software_candidate_is_valid(spec, candidate):
+                stale_candidates.append(str(candidate))
+        if stale_candidates:
+            results.append(CheckResult(
+                name="software_paths.write",
+                ok=False,
+                code=CODE_SOFTWARE_PATH_NOT_FOUND,
+                message="候选程序在写入前发生变化，已保留原配置",
+                severity=SEVERITY_ERROR,
+                details={"stale_candidates": stale_candidates},
+            ))
             return results
 
         merged_updates: dict[tuple[str, ...], str] = {}
@@ -567,7 +601,7 @@ class ConfigManager:
                 name="software_paths.write",
                 ok=False,
                 code=CODE_INTERNAL,
-                message="軟體位址關聯欄位出現衝突，已拒絕寫入",
+                message="软件地址关联字段出现冲突，已拒绝写入",
                 severity=SEVERITY_ERROR,
                 details={"conflicting_fields": sorted(set(conflicts))},
             ))
@@ -586,7 +620,7 @@ class ConfigManager:
                 name="software_paths.write",
                 ok=False,
                 code=CODE_KEY_MISSING,
-                message="軟體位址關聯欄位不存在，已拒絕寫入",
+                message="软件地址关联字段不存在，已拒绝写入",
                 severity=SEVERITY_ERROR,
                 details={"missing_fields": invalid_fields},
             ))
@@ -601,7 +635,7 @@ class ConfigManager:
                 name="software_paths.backup",
                 ok=False,
                 code=code,
-                message=f"軟體位址寫入前備份失敗，已中止：{exc}",
+                message=f"软件地址写入前备份失败，已中止：{exc}",
                 severity=SEVERITY_ERROR,
                 details={},
             ))
@@ -613,27 +647,27 @@ class ConfigManager:
             with open(self._config_path, "r", encoding="utf-8") as fh:
                 verified_cfg = json.load(fh)
             if not isinstance(verified_cfg, dict):
-                raise ValueError("寫入後設定根層級不是物件")
+                raise ValueError("写入后配置根层级不是对象")
             mismatches = [
                 ".".join(keys)
                 for keys, value in merged_updates.items()
                 if not _path_values_equal(_get_nested(verified_cfg, keys), value)
             ]
             if mismatches:
-                raise ValueError(f"寫入後欄位不符：{mismatches}")
+                raise ValueError(f"写入后字段不符：{mismatches}")
         except Exception as exc:
             rollback_error = ""
             try:
                 _atomic_write_text(self._config_path, original_text)
                 self._config_cache = cfg
             except Exception as rollback_exc:  # pragma: no cover - 極端磁碟故障
-                rollback_error = f"；回復原設定也失敗：{rollback_exc}"
+                rollback_error = f"；恢复原配置也失败：{rollback_exc}"
                 self._config_cache = None
             results.append(CheckResult(
                 name="software_paths.write",
                 ok=False,
                 code=CODE_SOFTWARE_PATH_WRITE_FAILED,
-                message=f"軟體位址寫入或驗證失敗：{exc}{rollback_error}",
+                message=f"软件地址写入或验证失败：{exc}{rollback_error}",
                 severity=SEVERITY_ERROR,
                 details={"backup_id": backup.backup_id},
             ))
@@ -649,8 +683,8 @@ class ConfigManager:
                 ok=True,
                 code=CODE_SOFTWARE_PATH_REPAIRED,
                 message=(
-                    f"已自動更新 {spec['display_name']} 位址與關聯設定，"  # type: ignore[index]
-                    "管理員排程將依新設定重新核對"
+                    f"已自动更新 {spec['display_name']} 地址与关联配置，"  # type: ignore[index]
+                    "管理员计划任务将按新配置重新核对"
                 ),
                 severity=SEVERITY_INFO,
                 details=details,
@@ -1454,29 +1488,29 @@ class ConfigManager:
         self,
         options: Mapping[str, object],
     ) -> tuple[list[Path], list[str]]:
-        """解析受限搜尋根目錄；拒絕整個磁碟根目錄。"""
+        """解析受限搜索根目录；拒绝整个磁盘根目录。"""
         raw_roots = options.get("search_roots", [])
         if not isinstance(raw_roots, (list, tuple)):
-            return [], ["search_roots 必須是路徑陣列"]
+            return [], ["search_roots 必须是路径数组"]
         roots: list[Path] = []
         issues: list[str] = []
         seen: set[str] = set()
         for raw_root in raw_roots:
             if not isinstance(raw_root, str) or not raw_root.strip():
-                issues.append("忽略空白或非字串搜尋根目錄")
+                issues.append("忽略空白或非字符串搜索根目录")
                 continue
             expanded = os.path.expandvars(os.path.expanduser(raw_root.strip()))
             root = Path(expanded)
             if not root.is_absolute():
-                issues.append(f"搜尋根目錄不是絕對路徑：{raw_root}")
+                issues.append(f"搜索根目录不是绝对路径：{raw_root}")
                 continue
             normalized = _normalized_path(root)
             anchor = _normalized_path(Path(root.anchor)) if root.anchor else ""
             if normalized == anchor:
-                issues.append(f"拒絕掃描整個磁碟根目錄：{root}")
+                issues.append(f"拒绝扫描整个磁盘根目录：{root}")
                 continue
             if not root.is_dir():
-                issues.append(f"搜尋根目錄不存在：{root}")
+                issues.append(f"搜索根目录不存在：{root}")
                 continue
             if normalized in seen:
                 continue
@@ -1492,7 +1526,7 @@ class ConfigManager:
         max_depth: int,
         max_directories: int,
     ) -> tuple[dict[str, list[Path]], list[str], bool]:
-        """一次掃描建立候選索引，避免每種軟體重複走訪目錄。"""
+        """一次扫描建立候选索引，避免每种软件重复遍历目录。"""
         index: dict[str, list[Path]] = {name: [] for name in filenames}
         issues: list[str] = []
         visited_directories = 0
@@ -1505,7 +1539,7 @@ class ConfigManager:
         def on_error(exc: OSError) -> None:
             nonlocal scan_complete
             scan_complete = False
-            issues.append(f"無法讀取目錄：{getattr(exc, 'filename', '')}（{exc}）")
+            issues.append(f"无法读取目录：{getattr(exc, 'filename', '')}（{exc}）")
 
         stop_scan = False
         for root in roots:
@@ -1518,7 +1552,7 @@ class ConfigManager:
                 if visited_directories > max_directories:
                     scan_complete = False
                     issues.append(
-                        f"搜尋目錄數超過上限 {max_directories}，已停止掃描"
+                        f"搜索目录数超过上限 {max_directories}，已停止扫描"
                     )
                     stop_scan = True
                     break
@@ -1527,7 +1561,7 @@ class ConfigManager:
                     depth = len(current_path.relative_to(root).parts)
                 except ValueError:
                     scan_complete = False
-                    issues.append(f"搜尋目錄逸出根目錄：{current_path}")
+                    issues.append(f"搜索目录逸出根目录：{current_path}")
                     dir_names[:] = []
                     continue
                 dir_names[:] = [
@@ -1551,7 +1585,7 @@ class ConfigManager:
         spec: Mapping[str, object],
         candidate: Path,
     ) -> bool:
-        """以伴隨檔案辨識候選，避免只憑同名 exe 自動改址。"""
+        """以伴随文件辨识候选，避免只凭同名 exe 自动改址。"""
         if not candidate.is_file():
             return False
         if candidate.name.casefold() != str(spec["filename"]).casefold():
@@ -1591,7 +1625,7 @@ class ConfigManager:
         candidate: Path,
         cfg: Mapping[str, object],
     ) -> dict[tuple[str, ...], str]:
-        """由已驗證候選導出執行檔與所有必須同步的路徑欄位。"""
+        """由已验证候选导出程序与所有必须同步的路径字段。"""
         executable_keys = tuple(spec["executable_path"])  # type: ignore[arg-type]
         updates: dict[tuple[str, ...], str] = {
             executable_keys: str(candidate),
@@ -2036,7 +2070,7 @@ def _same_path_style(
     absolute_path: Path,
     relative_name: str,
 ) -> str:
-    """原欄位是相對路徑時維持相對形式，避免無必要的格式變動。"""
+    """原字段是相对路径时维持相对形式，避免无必要的格式变动。"""
     if isinstance(configured_value, str) and configured_value:
         try:
             if not Path(configured_value).is_absolute():

@@ -114,6 +114,9 @@ class DailyGamesApp:
         self._auto_exit_scheduled = False
         self._exit_when_stopped = False
         self._stop_exit_wait_generation = 0
+        self._initial_setup_in_progress = False
+        self._initial_setup_resolved = False
+        self._initial_check_results = []
 
         root.title("一键日常")
         root.minsize(920, 680)
@@ -137,7 +140,7 @@ class DailyGamesApp:
         self._refresh_controls()
         self._poll()
         if auto_setup:
-            # 首次启动：背景检查配置，有问题才开启配置向导。
+            # 首次启动：先检查地址与配置，再确认是否仍有待应用变更。
             self.controller.check_configuration(self._on_initial_check)
 
     # ------------------------------------------------------------------
@@ -513,7 +516,7 @@ class DailyGamesApp:
             font=("Microsoft YaHei UI", 9, "bold"),
         ).pack(side=tk.LEFT, padx=(0, 8))
         self.btn_check = ttk.Button(
-            tool_frame, text="检查第三方配置", style="Tool.TButton",
+            tool_frame, text="检查软件地址与配置", style="Tool.TButton",
             command=self._on_check_config,
         )
         self.btn_restore = ttk.Button(
@@ -996,9 +999,27 @@ class DailyGamesApp:
     # ------------------------------------------------------------------
 
     def _on_initial_check(self, results):
+        if getattr(self, "_initial_setup_resolved", False) or getattr(
+            self, "_initial_setup_in_progress", False,
+        ):
+            return
+        self._initial_check_results = list(results)
         if any(not r.ok for r in results):
+            self._initial_setup_resolved = True
             self._auto_start_pending = False
             self._show_setup_wizard(results)
+            return
+        self._initial_setup_in_progress = True
+        self.controller.plan_configuration_changes(self._on_initial_plan)
+
+    def _on_initial_plan(self, changes):
+        if getattr(self, "_initial_setup_resolved", False):
+            return
+        self._initial_setup_in_progress = False
+        self._initial_setup_resolved = True
+        if changes:
+            self._auto_start_pending = False
+            self._show_setup_wizard(self._initial_check_results)
             return
         if self._auto_start_pending:
             # 一键入口只在首次检查全部通过后自动启动一次；先清除标记，
@@ -1014,9 +1035,15 @@ class DailyGamesApp:
         wizard.minsize(640, 460)
         self._prepare_dialog(wizard)
 
+        failed_results = [result for result in results if not result.ok]
+        intro = (
+            "以下软件地址或配置检查未通过，可加载建议变更后勾选应用："
+            if failed_results
+            else "检测到一键运行所需的待确认配置变更："
+        )
         ttk.Label(
             wizard,
-            text="以下配置检查未通过，可加载建议变更后勾选应用：",
+            text=intro,
             padding=(12, 8),
             style="DialogTitle.TLabel",
         ).pack(anchor=tk.W)
@@ -1026,8 +1053,8 @@ class DailyGamesApp:
         failed_text.pack(fill=tk.X, padx=12)
         self._style_text_widget(failed_text)
         self._set_text(failed_text, "\n".join(
-            format_check_result(r) for r in results if not r.ok
-        ) or "（无失败项目）")
+            format_check_result(r) for r in failed_results
+        ) or "（地址检查已通过，仍有待确认的配置变更）")
 
         changes_frame = ttk.LabelFrame(wizard, text="建议变更", padding=8)
         changes_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
@@ -1108,7 +1135,7 @@ class DailyGamesApp:
 
     def _show_check_results(self, results):
         self._show_text_dialog(
-            "第三方配置检查结果",
+            "软件地址与配置检查结果",
             "\n".join(format_check_result(r) for r in results)
             or "（无检查结果）",
         )

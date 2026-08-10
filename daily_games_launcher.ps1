@@ -41,19 +41,18 @@ function Get-PythonwPath {
 function Invoke-SoftwarePathSelfCheck {
     param([string]$PythonwPath)
 
-    # 必須先完成位址自查，後續排程規格才會使用更新後的執行檔與工作目錄。
-    # pythonw 讓這個啟動前步驟不顯示終端機視窗，退出碼仍可供失敗關閉判斷。
-    $repairArguments = (
-        '"' + $EntryPath.Replace('"', '\"') + '" --repair-paths'
-    )
-    $repair = Start-Process `
-        -FilePath $PythonwPath `
-        -ArgumentList $repairArguments `
-        -WorkingDirectory $ProjectRoot `
-        -WindowStyle Hidden `
-        -Wait `
-        -PassThru
-    if ($repair.ExitCode -ne 0) {
+    # 必须先完成地址自查，后续计划任务规格才会使用更新后的程序与工作目录。
+    # 外层 PowerShell 已以隐藏窗口启动；这里使用同一安装目录的 python.exe
+    # 并逐项传参，确保 --repair-paths 不会在 Start-Process 引号处理中丢失。
+    $pythonPath = Join-Path `
+        ([System.IO.Path]::GetDirectoryName($PythonwPath)) `
+        'python.exe'
+    if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
+        throw "找不到与 pythonw.exe 配套的 python.exe：$pythonPath"
+    }
+    & $pythonPath $EntryPath '--repair-paths'
+    $repairExitCode = $LASTEXITCODE
+    if ($repairExitCode -ne 0) {
         throw (
             '软件地址自查未通过。请打开程序执行 --dry-run 查看候选、' +
             '搜索根目录或多版本冲突。'

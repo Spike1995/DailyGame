@@ -2,7 +2,7 @@
 
 导入本模块不会执行 GUI、进程或配置操作。GUI 路径由 Windows 命名互斥锁保护；
 只读的 ``--dry-run`` 路径保持独立，可在已有实例运行时继续诊断。
-``--repair-paths`` 供一键启动器在注册管理员排程前执行受限的软件位址自查。
+``--repair-paths`` 供一键启动器在注册管理员计划任务前执行受限的软件地址自查。
 """
 
 from __future__ import annotations
@@ -87,7 +87,7 @@ def _default_gui_runner(config_path: Path) -> None:
 
 
 def _default_path_repairer(config_path: Path):
-    """執行一鍵啟動前的軟體位址自查，不啟動 GUI 或外部軟體。"""
+    """执行一键启动前的软件地址自查，不启动 GUI 或外部软件。"""
     from daily_games.config_manager import ConfigManager
 
     project_root = config_path.resolve().parent.parent
@@ -141,7 +141,7 @@ def _default_gui_error_reporter(message: str) -> None:
 
 
 def _parse_args(argv: Sequence[str], error_output: TextIO | None) -> str | None:
-    """解析單一執行模式；參數無效時輸出簡短用法。"""
+    """解析单一执行模式；参数无效时输出简短用法。"""
     arguments = list(argv)
     if not arguments:
         return _MODE_GUI
@@ -167,7 +167,7 @@ def main(
     error_output: TextIO | None = None,
     gui_error_reporter: Callable[[str], None] | None = None,
 ) -> int:
-    """執行 GUI、唯讀診斷或啟動前軟體位址自查，並傳回退出碼。"""
+    """执行 GUI、只读诊断或启动前软件地址自查，并返回退出码。"""
     # 仅重新配置解释器的默认流。显式注入的流通常由测试或宿主所有，
     # 必须保留自身语义。
     output = output if output is not None else _best_effort_utf8_stream(sys.stdout)
@@ -197,7 +197,7 @@ def main(
             results = list(repairer(CONFIG_PATH))
         except Exception as exc:
             _write_line(
-                f"軟體位址自查失敗：{type(exc).__name__}：{exc}",
+                f"软件地址自查失败：{type(exc).__name__}：{exc}",
                 error_output,
             )
             return 2

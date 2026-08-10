@@ -21,6 +21,10 @@ from daily_games.config_manager import (
     CODE_KEY_MISSING,
     CODE_OK,
     CODE_PARSE_FAILED,
+    CODE_SOFTWARE_PATH_AMBIGUOUS,
+    CODE_SOFTWARE_PATH_CHANGE_REQUIRED,
+    CODE_SOFTWARE_PATH_NOT_FOUND,
+    CODE_SOFTWARE_PATH_REPAIRED,
     CODE_VERIFY_AFTER_WRITE_FAILED,
     CODE_YAML_MULTILINE_OR_CORRUPT,
     ConfigManager,
@@ -155,6 +159,46 @@ def _make_user_config(tmp: Path, games_override: dict | None = None) -> Path:
     return user_path
 
 
+def _enable_software_path_check(
+    user_path: Path,
+    search_root: Path,
+    *software_ids: str,
+) -> None:
+    data = json.loads(user_path.read_text(encoding="utf-8"))
+    data["software_path_self_check"] = {
+        "enabled": True,
+        "auto_repair_unique_match": True,
+        "software_ids": list(software_ids),
+        "search_roots": [str(search_root)],
+        "max_depth": 3,
+        "max_directories": 500,
+    }
+    user_path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _make_valid_maa_install(directory: Path) -> Path:
+    directory.mkdir(parents=True)
+    (directory / "resource").mkdir()
+    (directory / "config").mkdir()
+    (directory / "MAA.exe").write_text("exe")
+    (directory / "MAA.dll").write_text("dll")
+    (directory / "MAA.runtimeconfig.json").write_text("{}")
+    (directory / "config" / "gui.new.json").write_text(
+        json.dumps({
+            "Current": "Default",
+            "Configurations": {"Default": {"Gui": {
+                "StartUpSettings": {"RunDirectly": True},
+                "PostActions": "ExitArknights, ExitSelf",
+            }}},
+        }),
+        encoding="utf-8",
+    )
+    return directory / "MAA.exe"
+
+
 class TestLoad(unittest.TestCase):
     def test_load_ok(self):
         with tempfile.TemporaryDirectory() as td:
@@ -280,6 +324,144 @@ class TestPreflight(unittest.TestCase):
             self.assertEqual(completion.code, "aalc_one_shot_unverified")
 
 
+class TestSoftwarePathSelfCheck(unittest.TestCase):
+    def test_read_only_check_reports_unique_candidate_without_writing(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            user_path = _make_user_config(tmp)
+            configured_maa = tmp / "MAA.exe"
+            configured_maa.unlink()
+            search_root = tmp / "software"
+            candidate = _make_valid_maa_install(search_root / "MAA-v7")
+            _enable_software_path_check(user_path, search_root, "maa")
+            before = user_path.read_bytes()
+
+            results = ConfigManager(
+                user_path, tmp / "backups",
+            ).reconcile_software_paths(apply=False)
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(
+                results[0].code, CODE_SOFTWARE_PATH_CHANGE_REQUIRED,
+            )
+            self.assertFalse(results[0].ok)
+            self.assertEqual(results[0].details["candidate"], str(candidate))
+            self.assertEqual(user_path.read_bytes(), before)
+            self.assertFalse((tmp / "backups").exists())
+
+    def test_unique_candidate_repairs_executable_and_linked_paths_with_backup(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            user_path = _make_user_config(tmp)
+            (tmp / "MAA.exe").unlink()
+            search_root = tmp / "software"
+            install_dir = search_root / "MAA-v7"
+            candidate = _make_valid_maa_install(install_dir)
+            _enable_software_path_check(user_path, search_root, "maa")
+
+            results = ConfigManager(
+                user_path, tmp / "backups",
+            ).reconcile_software_paths(apply=True)
+
+            repaired = next(
+                result for result in results
+                if result.code == CODE_SOFTWARE_PATH_REPAIRED
+            )
+            self.assertTrue(repaired.ok)
+            data = json.loads(user_path.read_text(encoding="utf-8"))
+            helper = data["games"]["arknights"]["helper"]
+            self.assertEqual(helper["executable"], str(candidate))
+            self.assertEqual(helper["config_dir"], str(install_dir / "config"))
+            self.assertEqual(helper["config_file"], "gui.new.json")
+            backup_id = repaired.details["backup_id"]
+            manifests = list((tmp / "backups").glob("*/manifest.json"))
+            self.assertEqual(len(manifests), 1)
+            manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+            self.assertEqual(manifest["backup_id"], backup_id)
+            self.assertEqual(
+                manifest["entries"][0]["original_absolute_path"],
+                str(user_path.resolve()),
+            )
+
+    def test_multiple_valid_candidates_are_ambiguous_and_never_written(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            user_path = _make_user_config(tmp)
+            (tmp / "MAA.exe").unlink()
+            search_root = tmp / "software"
+            _make_valid_maa_install(search_root / "MAA-v7-a")
+            _make_valid_maa_install(search_root / "MAA-v7-b")
+            _enable_software_path_check(user_path, search_root, "maa")
+            before = user_path.read_bytes()
+
+            results = ConfigManager(
+                user_path, tmp / "backups",
+            ).reconcile_software_paths(apply=True)
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].code, CODE_SOFTWARE_PATH_AMBIGUOUS)
+            self.assertFalse(results[0].ok)
+            self.assertEqual(len(results[0].details["candidates"]), 2)
+            self.assertEqual(user_path.read_bytes(), before)
+            self.assertFalse((tmp / "backups").exists())
+
+    def test_same_name_without_identity_files_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            user_path = _make_user_config(tmp)
+            (tmp / "MAA.exe").unlink()
+            search_root = tmp / "software"
+            fake_dir = search_root / "unrelated"
+            fake_dir.mkdir(parents=True)
+            (fake_dir / "MAA.exe").write_text("not MAA")
+            _enable_software_path_check(user_path, search_root, "maa")
+
+            results = ConfigManager(
+                user_path, tmp / "backups",
+            ).reconcile_software_paths(apply=True)
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].code, CODE_SOFTWARE_PATH_NOT_FOUND)
+            self.assertFalse(results[0].ok)
+            self.assertFalse((tmp / "backups").exists())
+
+    def test_drive_root_is_rejected_without_scanning_or_writing(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            user_path = _make_user_config(tmp)
+            (tmp / "MAA.exe").unlink()
+            drive_root = Path(tmp.anchor)
+            _enable_software_path_check(user_path, drive_root, "maa")
+
+            results = ConfigManager(
+                user_path, tmp / "backups",
+            ).reconcile_software_paths(apply=True)
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].code, CODE_SOFTWARE_PATH_NOT_FOUND)
+            self.assertTrue(any(
+                "整个磁盘根目录" in issue
+                for issue in results[0].details["scan_issues"]
+            ))
+            self.assertFalse((tmp / "backups").exists())
+
+    def test_preflight_includes_read_only_candidate_diagnostic(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            user_path = _make_user_config(tmp)
+            (tmp / "MAA.exe").unlink()
+            search_root = tmp / "software"
+            _make_valid_maa_install(search_root / "MAA-v7")
+            _enable_software_path_check(user_path, search_root, "maa")
+
+            results = ConfigManager(user_path, tmp / "backups").preflight()
+            codes = {result.code for result in results}
+
+            self.assertIn(CODE_SOFTWARE_PATH_CHANGE_REQUIRED, codes)
+            self.assertIn(CODE_FILE_NOT_FOUND, codes)
+            self.assertFalse((tmp / "backups").exists())
+
+
 class TestPlanChanges(unittest.TestCase):
     def test_plan_returns_defined_changes_with_masked_values(self):
         with tempfile.TemporaryDirectory() as td:
@@ -383,7 +565,7 @@ class TestApplyChanges(unittest.TestCase):
             self.assertTrue(all(result.ok for result in results))
             text = yaml_path.read_text(encoding="utf-8")
             self.assertIn(
-                "game_path: D:\\SteamLibrary\\steamapps\\common\\Limbus Company\\LimbusCompany.exe # 游戏启动路径。",
+                "game_path: D:\\Steam\\LimbusCompany.exe # 游戏启动路径。",
                 text,
             )
             self.assertNotIn("\n  Company\\LimbusCompany.exe", text)
