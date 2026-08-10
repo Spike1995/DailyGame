@@ -1,0 +1,29 @@
+# Local configuration and machine-specific state
+config/user.json
+config/*.local.*
+
+# Runtime output and backups
+logs/
+backups/
+.generated/
+
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local/editor files
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+
+# Build/package output
+dist/
+build/
+*.egg-info/
