@@ -43,9 +43,12 @@ class FakeProcessMonitor:
         self.wait_window_results: list[dict[str, object]] = []
         self.wait_exit_results: dict[int, bool] = {}
         self.wait_exit_calls: list[int] = []
+        self.find_calls: list[tuple[str, str | None]] = []
+        self.wait_process_calls: list[tuple[str, str | None]] = []
         self.terminated: list[int] = []
         self.launch_calls: list[tuple[list[str], str | None]] = []
         self.claimed: list[int] = []
+        self.claim_calls: list[tuple[int, str | None, float | None]] = []
         self.scheduled_task_matches_result = True
         self.start_scheduled_task_result = True
         self.stop_scheduled_task_result = True
@@ -67,7 +70,10 @@ class FakeProcessMonitor:
     def set_wait_exit(self, pid: int, exited: bool):
         self.wait_exit_results[pid] = exited
 
-    def find_by_executable(self, name: str) -> list[ProcessRecord]:
+    def find_by_executable(
+        self, name: str, *, expected_path: str | None = None,
+    ) -> list[ProcessRecord]:
+        self.find_calls.append((name, expected_path))
         key = name.lower()
         sequence = self.find_sequences.get(key)
         if sequence:
@@ -89,7 +95,14 @@ class FakeProcessMonitor:
                             owned=True, create_time=0.0)
         return rec
 
-    def take_ownership(self, pid: int) -> ProcessRecord | None:
+    def take_ownership(
+        self,
+        pid: int,
+        *,
+        expected_path: str | None = None,
+        expected_create_time: float | None = None,
+    ) -> ProcessRecord | None:
+        self.claim_calls.append((pid, expected_path, expected_create_time))
         records = [
             record
             for values in [
@@ -114,7 +127,10 @@ class FakeProcessMonitor:
         self.claimed.append(pid)
         return rec
 
-    def wait_for_process(self, name, timeout_s, stop_event=None):
+    def wait_for_process(
+        self, name, timeout_s, stop_event=None, *, expected_path=None,
+    ):
+        self.wait_process_calls.append((name, expected_path))
         return list(self.wait_process_results.get(name.lower(), []))
 
     def wait_for_window(self, pid, timeout_s, stop_event=None, title_regex=None):
@@ -128,6 +144,7 @@ class FakeProcessMonitor:
         arguments="",
         expected_action_count=1,
         expected_wrapper_target="",
+        expected_wrapper_executable="",
     ):
         self.scheduled_task_match_calls.append(
             (
@@ -137,6 +154,7 @@ class FakeProcessMonitor:
                 arguments,
                 expected_action_count,
                 expected_wrapper_target,
+                expected_wrapper_executable,
             )
         )
         return self.scheduled_task_matches_result
@@ -425,6 +443,10 @@ class TestMaaAdapter(unittest.TestCase):
             self.assertEqual(
                 pm.scheduled_task_match_calls[0][5], "Arknights.exe"
             )
+            self.assertEqual(
+                pm.scheduled_task_match_calls[0][6],
+                str(cfg["game_executable"]),
+            )
 
     def test_check_environment_rejects_unverified_button_automation(self):
         with tempfile.TemporaryDirectory() as td:
@@ -505,7 +527,35 @@ class TestMaaAdapter(unittest.TestCase):
             self.assertEqual(pm.started_scheduled_tasks, ["DailyGames-MAA-Admin"])
             self.assertEqual(pm.launch_calls, [])
             self.assertEqual(pm.stopped_scheduled_tasks, ["DailyGames-MAA-Admin"])
+            self.assertIn(
+                ("MAA.exe", cfg["helper"]["executable"]),
+                pm.wait_process_calls,
+            )
             self.assertTrue(cleanup.ok)
+
+    def test_wait_game_ready_requires_configured_game_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _arknights_cfg(tmp, run_directly=True)
+            pm = FakeProcessMonitor()
+            pm.set_wait_process("Arknights.exe", [ProcessRecord(
+                pid=810,
+                executable="Arknights.exe",
+                full_path=cfg["game_executable"],
+                owned=False,
+                create_time=0.0,
+            )])
+
+            result = MaaAdapter(
+                game_cfg=cfg,
+                process_monitor=pm,
+            ).wait_game_ready(1)
+
+            self.assertTrue(result.ok)
+            self.assertEqual(
+                pm.wait_process_calls,
+                [("Arknights.exe", cfg["game_executable"])],
+            )
 
     def test_wait_completion_disabled_autorun_returns_manual_required(self):
         with tempfile.TemporaryDirectory() as td:
@@ -763,8 +813,13 @@ class TestMaaEndAdapter(unittest.TestCase):
             self.assertEqual(
                 pm.scheduled_task_match_calls[0][5], "Endfield.exe"
             )
+            self.assertEqual(
+                pm.scheduled_task_match_calls[0][6],
+                str(cfg["game_executable"]),
+            )
             self.assertEqual(pm.scheduled_task_match_calls[1][4], 1)
             self.assertEqual(pm.scheduled_task_match_calls[1][5], "")
+            self.assertEqual(pm.scheduled_task_match_calls[1][6], "")
 
     def test_check_environment_rejects_unverified_button_automation(self):
         with tempfile.TemporaryDirectory() as td:
@@ -858,6 +913,10 @@ class TestMaaEndAdapter(unittest.TestCase):
             self.assertEqual(
                 pm.stopped_scheduled_tasks,
                 ["DailyGames-MaaEnd-Admin", "DailyGames-Endfield-Admin"],
+            )
+            self.assertIn(
+                ("MaaEnd.exe", cfg["helper"]["executable"]),
+                pm.wait_process_calls,
             )
             self.assertTrue(cleanup.ok)
 
@@ -1245,7 +1304,15 @@ class TestMaaEndAdapter(unittest.TestCase):
             pm.set_wait_process("Endfield.exe", [game])
             pm.wait_window_results = [{"hwnd": 1, "title": "Endfield"}]
             self.assertTrue(adapter.wait_game_ready(1).ok)
+            self.assertEqual(
+                pm.wait_process_calls,
+                [("Endfield.exe", cfg["game_executable"])],
+            )
             self.assertEqual(pm.claimed, [777])
+            self.assertEqual(
+                pm.claim_calls,
+                [(777, cfg["game_executable"], None)],
+            )
             cleanup = adapter.cleanup()
             self.assertTrue(cleanup.ok)
             self.assertEqual(pm.terminated, [777])
@@ -1299,6 +1366,7 @@ class TestAalcAdapter(unittest.TestCase):
                     str(Path(cfg["helper"]["executable"]).parent),
                     "start --exit 6",
                     1,
+                    "",
                     "",
                 )],
             )
@@ -1355,6 +1423,10 @@ class TestAalcAdapter(unittest.TestCase):
             self.assertEqual(pm.started_scheduled_tasks, ["DailyGames-AALC-Admin"])
             self.assertEqual(pm.launch_calls, [])
             self.assertEqual(r.details["pids"], [812])
+            self.assertIn(
+                ("AALC.exe", cfg["helper"]["executable"]),
+                pm.wait_process_calls,
+            )
 
             cleanup = a.cleanup()
             self.assertTrue(cleanup.ok)
@@ -1512,10 +1584,15 @@ class TestAalcAdapter(unittest.TestCase):
             pm = FakeProcessMonitor()
             stop = threading.Event()
             stop.set()  # 预先触发
-            a = AalcAdapter(game_cfg=_limbus_cfg(tmp), process_monitor=pm)
+            cfg = _limbus_cfg(tmp)
+            a = AalcAdapter(game_cfg=cfg, process_monitor=pm)
             r = a.wait_game_ready(timeout_s=1, stop_event=stop)
             self.assertFalse(r.ok)
             self.assertEqual(r.code, CODE_STOP_REQUESTED)
+            self.assertEqual(
+                pm.wait_process_calls,
+                [("LimbusCompany.exe", cfg["game_executable"])],
+            )
 
 
 # --------------------------------------------------------------------------- #

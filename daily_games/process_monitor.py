@@ -1,8 +1,8 @@
 """进程监控：仅使用 Python 标准库。
 
 能力：
-- find_by_executable(name)：按可执行文件名查找现有进程（规范化大小写与完整路径）。
-- launch(command, cwd=None)：启动进程，保留 PID、启动时间与归属(owned=True)。
+- find_by_executable(name, expected_path=None)：按文件名查找，并可要求精确完整路径。
+- launch(command, cwd=None)：仅以绝对路径参数序列启动进程，保留 PID、启动时间与归属(owned=True)。
 - wait_for_process / wait_for_window / wait_for_exit：尊重超时与停止事件，不永久阻塞。
 - terminate_if_owned(pid)：只结束本程序启动或明确接管的挂机工具。
 
@@ -19,12 +19,14 @@ import hashlib
 import json
 import locale
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
@@ -37,6 +39,38 @@ IS_WINDOWS = sys.platform.startswith("win")
 # ToolHelp32
 TH32CS_SNAPPROCESS = 0x00000002
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+FILE_SHARE_ALL = 0x00000001 | 0x00000002 | 0x00000004
+OPEN_EXISTING = 3
+ERROR_ACCESS_DENIED = 5
+ERROR_NO_MORE_FILES = 18
+ERROR_INVALID_PARAMETER = 87
+SCHTASKS_TIMEOUT_S = 15
+PROCESS_TERMINATE = 0x0001
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+SYNCHRONIZE = 0x00100000
+STILL_ACTIVE = 259
+WAIT_OBJECT_0 = 0
+TERMINATE_WAIT_MS = 5_000
+
+_FILE_MUTATION_RIGHTS = (
+    0x00000002,  # FILE_WRITE_DATA
+    0x00000004,  # FILE_APPEND_DATA
+    0x00000010,  # FILE_WRITE_EA
+    0x00000100,  # FILE_WRITE_ATTRIBUTES
+    0x00010000,  # DELETE
+    0x00040000,  # WRITE_DAC
+    0x00080000,  # WRITE_OWNER
+)
+_DIRECTORY_MUTATION_RIGHTS = (
+    0x00000002,  # FILE_ADD_FILE
+    0x00000004,  # FILE_ADD_SUBDIRECTORY
+    0x00000040,  # FILE_DELETE_CHILD
+    0x00010000,  # DELETE
+    0x00040000,  # WRITE_DAC
+    0x00080000,  # WRITE_OWNER
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -55,8 +89,134 @@ if IS_WINDOWS:
             ("th32ParentProcessID", ctypes.c_uint32),
             ("pcPriClassBase", ctypes.c_int32),
             ("dwFlags", ctypes.c_uint32),
-            ("szExeFile", ctypes.c_char * 260),
+            ("szExeFile", ctypes.c_wchar * 260),
         ]
+
+
+    class _FileTime(ctypes.Structure):
+        _fields_ = [
+            ("dwLowDateTime", ctypes.c_uint32),
+            ("dwHighDateTime", ctypes.c_uint32),
+        ]
+
+
+    _WindowEnumProc = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_ssize_t,
+    )
+
+
+@lru_cache(maxsize=1)
+def _kernel32_process_api():
+    """载入并声明进程相关 Win32 API，避免 64 位 HANDLE 被截断。"""
+    if not IS_WINDOWS:
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+        ]
+        kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        kernel32.Process32FirstW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_ProcessEntry32),
+        ]
+        kernel32.Process32FirstW.restype = ctypes.c_int
+        kernel32.Process32NextW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_ProcessEntry32),
+        ]
+        kernel32.Process32NextW.restype = ctypes.c_int
+        kernel32.OpenProcess.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_int,
+            ctypes.c_uint32,
+        ]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_wchar_p,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
+        kernel32.GetProcessTimes.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_FileTime),
+            ctypes.POINTER(_FileTime),
+            ctypes.POINTER(_FileTime),
+            ctypes.POINTER(_FileTime),
+        ]
+        kernel32.GetProcessTimes.restype = ctypes.c_int
+        kernel32.GetExitCodeProcess.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        kernel32.GetExitCodeProcess.restype = ctypes.c_int
+        kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.TerminateProcess.restype = ctypes.c_int
+        kernel32.WaitForSingleObject.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        return kernel32
+    except (AttributeError, OSError, TypeError):
+        return None
+
+
+@lru_cache(maxsize=1)
+def _user32_window_api():
+    """载入并声明窗口相关 Win32 API。"""
+    if not IS_WINDOWS:
+        return None
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.EnumWindows.argtypes = [_WindowEnumProc, ctypes.c_ssize_t]
+        user32.EnumWindows.restype = ctypes.c_int
+        user32.GetWindowThreadProcessId.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        user32.GetWindowThreadProcessId.restype = ctypes.c_uint32
+        user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+        user32.IsWindowVisible.restype = ctypes.c_int
+        user32.GetWindowTextLengthW.argtypes = [ctypes.c_void_p]
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_int,
+        ]
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.GetClassNameW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_int,
+        ]
+        user32.GetClassNameW.restype = ctypes.c_int
+        user32.PostMessageW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_size_t,
+            ctypes.c_ssize_t,
+        ]
+        user32.PostMessageW.restype = ctypes.c_int
+        return user32
+    except (AttributeError, OSError, TypeError):
+        return None
+
+
+def _windows_api_error(operation: str) -> OSError:
+    error_code = int(ctypes.get_last_error())
+    return OSError(
+        error_code or 1,
+        f"{operation} 失败（Windows 错误 {error_code or '未知'}）",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -96,6 +256,30 @@ def _exe_matches(record_exe: str, target: str) -> bool:
     return Path(record_exe).name.lower() == target_norm
 
 
+def _process_identity_matches(
+    record_exe: str,
+    record_path: str,
+    target_name: str,
+    expected_path: str | os.PathLike[str] | None,
+) -> bool:
+    """先核对文件名；指定路径时，路径缺失或非绝对路径均拒绝。"""
+    if not (
+        _exe_matches(record_exe, target_name)
+        or _exe_matches(record_path, target_name)
+    ):
+        return False
+    if expected_path is None:
+        return True
+    try:
+        record_text = os.fspath(record_path)
+        expected_text = os.fspath(expected_path)
+        if not os.path.isabs(record_text) or not os.path.isabs(expected_text):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return _same_path(record_text, expected_text)
+
+
 # --------------------------------------------------------------------------- #
 # Windows 进程列举（ToolHelp32）                                            #
 # --------------------------------------------------------------------------- #
@@ -105,22 +289,32 @@ def _snapshot_processes() -> list[dict[str, object]]:
     """以 ToolHelp32 列举进程。返回 [{pid, exe, path}]。非 Windows 返回空。"""
     if not IS_WINDOWS:
         return []
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    kernel32 = _kernel32_process_api()
+    if kernel32 is None:
+        raise OSError("无法载入 Windows 进程列举 API")
+    ctypes.set_last_error(0)
     snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snapshot == INVALID_HANDLE_VALUE:
-        return []
+    if not snapshot or snapshot == INVALID_HANDLE_VALUE:
+        raise _windows_api_error("CreateToolhelp32Snapshot")
     try:
         entry = _ProcessEntry32()
         entry.dwSize = ctypes.sizeof(_ProcessEntry32)
-        if not kernel32.Process32First(snapshot, ctypes.byref(entry)):
-            return []
+        ctypes.set_last_error(0)
+        if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            if ctypes.get_last_error() == ERROR_NO_MORE_FILES:
+                return []
+            raise _windows_api_error("Process32FirstW")
         out: list[dict[str, object]] = []
         while True:
             pid = int(entry.th32ProcessID)
-            exe = entry.szExeFile.decode("mbcs", errors="replace")
+            exe = entry.szExeFile
             full_path = _query_full_path(pid) or exe
             out.append({"pid": pid, "exe": exe, "path": full_path})
-            if not kernel32.Process32Next(snapshot, ctypes.byref(entry)):
+            ctypes.set_last_error(0)
+            if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                error_code = int(ctypes.get_last_error())
+                if error_code not in {0, ERROR_NO_MORE_FILES}:
+                    raise _windows_api_error("Process32NextW")
                 break
         return out
     finally:
@@ -131,14 +325,15 @@ def _query_full_path(pid: int) -> str:
     """通过 QueryFullProcessImageNameW 获取完整路径；失败返回空字符串。"""
     if not IS_WINDOWS:
         return ""
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32 = _kernel32_process_api()
+    if kernel32 is None:
+        return ""
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return ""
     try:
-        buf = ctypes.create_unicode_buffer(1024)
-        size = ctypes.c_uint32(1024)
+        buf = ctypes.create_unicode_buffer(32768)
+        size = ctypes.c_uint32(len(buf))
         # QueryFullProcessImageNameW(handle, 0, buf, byref(size))
         ok = kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
         if ok:
@@ -152,16 +347,17 @@ def _get_create_time(pid: int) -> float:
     """获取进程创建时间（unix 秒）。无法获取回 0.0。"""
     if not IS_WINDOWS:
         return 0.0
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32 = _kernel32_process_api()
+    if kernel32 is None:
+        return 0.0
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return 0.0
     try:
-        ctime = ctypes.c_uint64()
-        etime = ctypes.c_uint64()
-        ktime = ctypes.c_uint64()
-        utime = ctypes.c_uint64()
+        ctime = _FileTime()
+        etime = _FileTime()
+        ktime = _FileTime()
+        utime = _FileTime()
         ok = kernel32.GetProcessTimes(
             handle, ctypes.byref(ctime), ctypes.byref(etime),
             ctypes.byref(ktime), ctypes.byref(utime),
@@ -170,7 +366,8 @@ def _get_create_time(pid: int) -> float:
             return 0.0
         # FILETIME 是 100ns 间隔，自 1601-01-01
         # 转成 unix 秒：减去 11644473600（秒）
-        return ctime.value / 10_000_000.0 - 11644473600.0
+        file_time = (ctime.dwHighDateTime << 32) | ctime.dwLowDateTime
+        return file_time / 10_000_000.0 - 11644473600.0
     finally:
         kernel32.CloseHandle(handle)
 
@@ -184,11 +381,13 @@ def _enum_windows_for_pid(pid: int) -> list[dict[str, object]]:
     """列举属于 pid 的顶层窗口。返回 [{hwnd, title, class}]。非 Windows 返回空。"""
     if not IS_WINDOWS:
         return []
-    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    user32 = _user32_window_api()
+    if user32 is None:
+        raise OSError("无法载入 Windows 窗口列举 API")
     results: list[dict[str, object]] = []
 
     # EnumWindows 回调签名：BOOL callback(HWND, LPARAM)
-    @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)  # type: ignore[attr-defined]
+    @_WindowEnumProc
     def enum_proc(hwnd: int, lparam: int) -> int:
         # 获取窗口所属 PID
         wpid = ctypes.c_uint32()
@@ -206,10 +405,16 @@ def _enum_windows_for_pid(pid: int) -> list[dict[str, object]]:
         user32.GetClassNameW(hwnd, cls_buf, 256)
         cls = cls_buf.value
         if title or cls:
-            results.append({"hwnd": int(hwnd), "title": title, "class": cls})
+            results.append({
+                "hwnd": int(hwnd or 0),
+                "title": title,
+                "class": cls,
+            })
         return 1
 
-    user32.EnumWindows(enum_proc, 0)
+    ctypes.set_last_error(0)
+    if not user32.EnumWindows(enum_proc, 0):
+        raise _windows_api_error("EnumWindows")
     return results
 
 
@@ -228,18 +433,26 @@ class ProcessMonitor:
     def __init__(self, poll_interval_s: float = 1.0):
         self._poll_interval = max(0.05, float(poll_interval_s))
         self._owned: dict[int, ProcessRecord] = {}
+        self._children: dict[int, subprocess.Popen] = {}
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     # 查找现有进程                                                    #
     # ------------------------------------------------------------------ #
 
-    def find_by_executable(self, name: str) -> list[ProcessRecord]:
-        """按可执行文件名查找现有进程，并返回包含 owned 标记的混合列表。
+    def find_by_executable(
+        self,
+        name: str,
+        *,
+        expected_path: str | os.PathLike[str] | None = None,
+    ) -> list[ProcessRecord]:
+        """按文件名查找进程，并可进一步要求完整路径精确匹配。
 
-        记录的 ``owned`` 区分本程序启动者与现有者。
+        记录的 ``owned`` 区分本程序启动者与现有者。指定 ``expected_path``
+        后，无法取得绝对进程路径的记录也会拒绝，避免同名程序成为启动或完成证据。
         """
         target = _norm_exe(name)
+        self._prune_exited_owned()
         with self._lock:
             owned_copy = dict(self._owned)
         results: list[ProcessRecord] = []
@@ -247,7 +460,12 @@ class ProcessMonitor:
 
         # 先纳入 owned 且符合者
         for pid, rec in owned_copy.items():
-            if _exe_matches(rec.executable, target) or _exe_matches(rec.full_path, target):
+            if _process_identity_matches(
+                rec.executable,
+                rec.full_path,
+                target,
+                expected_path,
+            ):
                 results.append(rec)
                 seen_pids.add(pid)
 
@@ -258,7 +476,7 @@ class ProcessMonitor:
             path = str(p["path"])
             if pid in seen_pids:
                 continue
-            if _exe_matches(exe, target) or _exe_matches(path, target):
+            if _process_identity_matches(exe, path, target, expected_path):
                 results.append(ProcessRecord(
                     pid=pid, executable=exe, full_path=path, owned=False,
                     create_time=_get_create_time(pid),
@@ -269,40 +487,51 @@ class ProcessMonitor:
     # 启动进程                                                        #
     # ------------------------------------------------------------------ #
 
-    def launch(self, command: Sequence[str] | str, cwd: str | os.PathLike[str] | None = None) -> ProcessRecord:
+    def launch(
+        self,
+        command: Sequence[str | os.PathLike[str]],
+        cwd: str | os.PathLike[str] | None = None,
+    ) -> ProcessRecord:
         """启动进程。
 
-        ``command`` 可为 list[str]（推荐，含空格路径安全）或字符串。
-        字符串形式会以 shell=False 通过 subprocess 处理；不手工拼接 shell 命令。
-        成功后记录 PID、启动时间，并标记 owned=True。
+        ``command`` 必须是非空参数序列，且首项为绝对可执行文件路径；不接受
+        字符串命令列或 PATH 搜索，避免 Windows 对含空格命令的模糊解析。成功后
+        记录 PID、启动时间，并标记 owned=True。
         """
-        if isinstance(command, str):
-            args: list[str] | str = command
-            shell = False
+        if isinstance(command, (str, bytes, os.PathLike)):
+            raise TypeError("command 必须是参数序列，不能是字符串或单一路径")
+        try:
+            args = [os.fspath(value) for value in command]
+        except (TypeError, ValueError) as exc:
+            raise TypeError("command 只能包含字符串或路径") from exc
+        if any(not isinstance(value, str) for value in args):
+            raise TypeError("command 只能包含文字路径或参数")
+        if not args or not args[0].strip() or not os.path.isabs(args[0]):
+            raise ValueError("command 的首项必须是绝对可执行文件路径")
+        if any("\0" in value for value in args):
+            raise ValueError("command 不得包含 NUL 字符")
+        if cwd is not None:
+            cwd_text = os.fspath(cwd)
+            if (
+                not isinstance(cwd_text, str)
+                or not cwd_text.strip()
+                or not os.path.isabs(cwd_text)
+            ):
+                raise ValueError("cwd 必须是绝对路径")
         else:
-            args = list(command)
-            shell = False
-
-        creationflags = 0
-        if IS_WINDOWS:
-            # 不创建新窗口抢焦；与被启动的 GUI 程序无冲突
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if False else 0
-            # 注意：MAA/MaaEnd/AALC 是 GUI 程序，不要用 CREATE_NO_WINDOW 否则可能影响其窗口
-            # 故保留 0，让它们正常显示。
+            cwd_text = None
 
         proc = subprocess.Popen(
             args,
-            cwd=str(cwd) if cwd is not None else None,
-            shell=shell,
-            stdout=subprocess.DEVNULL if False else None,
-            stderr=subprocess.DEVNULL if False else None,
+            cwd=cwd_text,
+            shell=False,
             stdin=subprocess.DEVNULL,
             close_fds=True,
         )
         pid = int(proc.pid)
         # 尝试获取完整路径与创建时间
         time.sleep(0.05)  # 给操作系统一点时间登录进程
-        full_path = _query_full_path(pid) or _exe_from_command(command)
+        full_path = _query_full_path(pid) or _exe_from_command(args)
         create_time = _get_create_time(pid) or time.time()
         rec = ProcessRecord(
             pid=pid,
@@ -310,10 +539,11 @@ class ProcessMonitor:
             full_path=full_path,
             owned=True,
             create_time=create_time,
-            extra={"returncode_attr": None, "argv": list(command) if not isinstance(command, str) else command},
+            extra={"returncode_attr": None, "argv": list(args)},
         )
         with self._lock:
             self._owned[pid] = rec
+            self._children[pid] = proc
         return rec
 
     def scheduled_task_matches(
@@ -324,12 +554,14 @@ class ProcessMonitor:
         arguments: str = "",
         expected_action_count: int = 1,
         expected_wrapper_target: str = "",
+        expected_wrapper_executable: str = "",
     ) -> bool:
         """只读核对计划任务动作及最高权限级别。
 
         助手任务必须只有一个精确匹配程序、目录与参数的动作。游戏任务也必须
-        只有一个系统 Windows PowerShell 短 ``-File`` 动作；包装脚本路径、
-        SHA-256 与版本化元数据必须精确匹配启动器、目录、参数和目标游戏进程。
+        只有一个系统 Windows PowerShell 短 ``-File`` 动作；包装脚本必须位于
+        受保护的 ProgramData 目录，且路径、SHA-256 与版本化元数据必须精确
+        匹配启动器、目录、参数和目标游戏进程。
         旧版双动作或长 ``-EncodedCommand`` 定义都会被拒绝。
         """
         if not IS_WINDOWS or not name:
@@ -354,10 +586,42 @@ class ProcessMonitor:
                 "{*}WorkingDirectory", default=""
             )
             actual_arguments = action.findtext("{*}Arguments", default="")
+            principal_user_id = root.findtext(".//{*}UserId", default="")
+            logon_type = root.findtext(".//{*}LogonType", default="")
             run_level = root.findtext(".//{*}RunLevel", default="")
+            multiple_instances = root.findtext(
+                ".//{*}MultipleInstancesPolicy", default=""
+            )
+            execution_time_limit = root.findtext(
+                ".//{*}ExecutionTimeLimit", default=""
+            )
+            disallow_on_battery = root.findtext(
+                ".//{*}DisallowStartIfOnBatteries", default=""
+            )
+            stop_on_battery = root.findtext(
+                ".//{*}StopIfGoingOnBatteries", default=""
+            )
+            allow_demand = root.findtext(
+                ".//{*}AllowStartOnDemand", default="true"
+            )
+            enabled = root.findtext(".//{*}Enabled", default="true")
+            triggers = root.findall(".//{*}Triggers/*")
         except (UnicodeError, ET.ParseError):
             return False
-        if run_level.strip().lower() != "highestavailable":
+        current_user_sid = _current_user_sid()
+        if (
+            not current_user_sid
+            or principal_user_id.strip().casefold() != current_user_sid.casefold()
+            or logon_type.strip().casefold() != "interactivetoken"
+            or run_level.strip().casefold() != "highestavailable"
+            or multiple_instances.strip().casefold() != "ignorenew"
+            or execution_time_limit.strip().upper() != "PT12H"
+            or disallow_on_battery.strip().casefold() != "false"
+            or stop_on_battery.strip().casefold() != "false"
+            or allow_demand.strip().casefold() != "true"
+            or enabled.strip().casefold() != "true"
+            or len(triggers) != 0
+        ):
             return False
         if not expected_wrapper_target:
             return (
@@ -365,17 +629,17 @@ class ProcessMonitor:
                 and _same_path(working_directory, cwd)
                 and actual_arguments.strip() == arguments.strip()
             )
+        if not expected_wrapper_executable:
+            return False
 
-        system_root = os.environ.get("SystemRoot", r"C:\Windows")
-        expected_powershell = (
-            Path(system_root)
-            / "System32"
-            / "WindowsPowerShell"
-            / "v1.0"
-            / "powershell.exe"
+        expected_powershell = _windows_system_file(
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe",
         )
         if (
-            not _same_path(command, expected_powershell)
+            expected_powershell is None
+            or not _same_path(command, expected_powershell)
             or not _same_path(working_directory, cwd)
         ):
             return False
@@ -389,12 +653,16 @@ class ProcessMonitor:
         if metadata is None:
             return False
         return (
-            metadata.get("version") == 3
+            metadata.get("version") == 4
             and _same_path(str(metadata.get("launcher_executable", "")), executable)
             and _same_path(str(metadata.get("working_directory", "")), cwd)
             and str(metadata.get("arguments", "")).strip() == arguments.strip()
             and str(metadata.get("target_process", "")).casefold()
             == expected_wrapper_target.casefold()
+            and _same_path(
+                str(metadata.get("target_executable", "")),
+                expected_wrapper_executable,
+            )
         )
 
     def start_scheduled_task(self, name: str) -> bool:
@@ -409,19 +677,47 @@ class ProcessMonitor:
             return False
         return _run_schtasks(["/End", "/TN", name]).returncode == 0
 
-    def take_ownership(self, pid: int) -> ProcessRecord | None:
+    def take_ownership(
+        self,
+        pid: int,
+        *,
+        expected_path: str | os.PathLike[str] | None = None,
+        expected_create_time: float | None = None,
+    ) -> ProcessRecord | None:
         """明确接管一个现有进程，使其可被 terminate_if_owned 结束。
 
-        返回新的 owned 记录；若 PID 不存在则返回 None。
+        ``expected_path`` 与 ``expected_create_time`` 用来复核先前快照，降低
+        PID 在查找与接管之间被重用的风险。身份不符或 PID 不存在时返回 None。
         """
         for p in _snapshot_processes():
             if int(p["pid"]) == pid:
+                executable = str(p["exe"])
+                full_path = str(p["path"])
+                if expected_path is not None and not _process_identity_matches(
+                    executable,
+                    full_path,
+                    Path(os.fspath(expected_path)).name,
+                    expected_path,
+                ):
+                    return None
+                create_time = _get_create_time(pid)
+                if expected_create_time is not None:
+                    try:
+                        expected_time = float(expected_create_time)
+                    except (TypeError, ValueError):
+                        return None
+                    if (
+                        expected_time <= 0.0
+                        or create_time <= 0.0
+                        or abs(create_time - expected_time) > 0.01
+                    ):
+                        return None
                 rec = ProcessRecord(
                     pid=pid,
-                    executable=str(p["exe"]),
-                    full_path=str(p["path"]),
+                    executable=executable,
+                    full_path=full_path,
                     owned=True,
-                    create_time=_get_create_time(pid) or time.time(),
+                    create_time=create_time or time.time(),
                 )
                 with self._lock:
                     self._owned[pid] = rec
@@ -433,13 +729,18 @@ class ProcessMonitor:
     # ------------------------------------------------------------------ #
 
     def wait_for_process(
-        self, name: str, timeout_s: float, stop_event: object | None = None,
+        self,
+        name: str,
+        timeout_s: float,
+        stop_event: object | None = None,
+        *,
+        expected_path: str | os.PathLike[str] | None = None,
     ) -> list[ProcessRecord]:
-        """等待指定可执行文件的进程出现。超时或停止时返回当前结果（可能为空）。"""
+        """等待指定程序出现；可要求完整路径，超时或停止时返回当前结果。"""
         deadline = time.monotonic() + max(0.0, timeout_s)
         last: list[ProcessRecord] = []
         while True:
-            last = self.find_by_executable(name)
+            last = self.find_by_executable(name, expected_path=expected_path)
             if last:
                 return last
             if _stop_requested(stop_event):
@@ -479,10 +780,8 @@ class ProcessMonitor:
         """等待 pid 结束。成功结束回 True；超时或停止回 False。"""
         deadline = time.monotonic() + max(0.0, timeout_s)
         while True:
-            if not self._is_alive(pid):
-                # 结束后从 owned 移除
-                with self._lock:
-                    self._owned.pop(pid, None)
+            if self._owned_process_has_exited(pid):
+                self._forget_owned(pid, reap_timeout_s=0.5)
                 return True
             if _stop_requested(stop_event):
                 return False
@@ -505,17 +804,54 @@ class ProcessMonitor:
             return False
         ok = _terminate_pid(pid, grace_s)
         if ok:
-            with self._lock:
-                self._owned.pop(pid, None)
-        return ok
+            return self._forget_owned(
+                pid,
+                reap_timeout_s=max(1.0, min(5.0, float(grace_s))),
+            )
+        # 进程可能恰好在宽限期边界自行退出，使 TerminateProcess 回报失败。
+        # 对本程序启动的子进程再做一次有界 wait，确认退出后仍应回收句柄。
+        with self._lock:
+            child = self._children.get(pid)
+        if child is not None:
+            return self._forget_owned(pid, reap_timeout_s=0.5)
+        return False
 
     def owned_pids(self) -> list[int]:
+        self._prune_exited_owned()
         with self._lock:
             return list(self._owned.keys())
 
     # ------------------------------------------------------------------ #
     # 内部                                                                #
     # ------------------------------------------------------------------ #
+
+    def _owned_process_has_exited(self, pid: int) -> bool:
+        with self._lock:
+            child = self._children.get(pid)
+        if child is not None:
+            return child.poll() is not None
+        return not self._is_alive(pid)
+
+    def _forget_owned(self, pid: int, *, reap_timeout_s: float) -> bool:
+        """回收本程序启动的 Popen，再移除 owned 记录。"""
+        with self._lock:
+            child = self._children.get(pid)
+        if child is not None:
+            try:
+                child.wait(timeout=max(0.0, reap_timeout_s))
+            except subprocess.TimeoutExpired:
+                return False
+        with self._lock:
+            self._owned.pop(pid, None)
+            self._children.pop(pid, None)
+        return True
+
+    def _prune_exited_owned(self) -> None:
+        with self._lock:
+            pids = tuple(self._owned)
+        for pid in pids:
+            if self._owned_process_has_exited(pid):
+                self._forget_owned(pid, reap_timeout_s=0.0)
 
     def _is_alive(self, pid: int) -> bool:
         if not IS_WINDOWS:
@@ -525,16 +861,24 @@ class ProcessMonitor:
                 return True
             except (OSError, ProcessLookupError):
                 return False
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        kernel32 = _kernel32_process_api()
+        if kernel32 is None:
+            return True
+        ctypes.set_last_error(0)
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION,
+            False,
+            pid,
+        )
         if not handle:
-            return False
+            # PID 不存在时 OpenProcess 回 ERROR_INVALID_PARAMETER。访问被拒或
+            # 其他未知错误不能证明进程已退出，必须保守视为仍在运行。
+            return ctypes.get_last_error() != ERROR_INVALID_PARAMETER
         try:
             exit_code = ctypes.c_uint32()
             if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
                 return True
-            # STILL_ACTIVE = 259
-            return exit_code.value == 259
+            return exit_code.value == STILL_ACTIVE
         finally:
             kernel32.CloseHandle(handle)
 
@@ -553,10 +897,8 @@ def _stop_requested(stop_event: object | None) -> bool:
     return False
 
 
-def _exe_from_command(command: Sequence[str] | str) -> str:
+def _exe_from_command(command: Sequence[str]) -> str:
     """从命令推测可执行文件路径（用于 launch 后立刻补 full_path）。"""
-    if isinstance(command, str):
-        return command
     if command:
         return str(command[0])
     return ""
@@ -575,8 +917,119 @@ def _same_path(left: str | os.PathLike[str], right: str | os.PathLike[str]) -> b
         return False
 
 
+def _protected_launcher_worker_root() -> Path | None:
+    """返回系统 ProgramData 下受保护的启动器 worker 目录。"""
+    if not IS_WINDOWS:
+        return None
+    try:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        get_folder_path = shell32.SHGetFolderPathW
+        get_folder_path.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_wchar_p,
+        ]
+        get_folder_path.restype = ctypes.c_int32
+        buffer = ctypes.create_unicode_buffer(32768)
+        # CSIDL_COMMON_APPDATA = 0x23，与 PowerShell CommonApplicationData 一致。
+        if get_folder_path(None, 0x23, None, 0, buffer) != 0:
+            return None
+        common_data = buffer.value.strip()
+        if not common_data:
+            return None
+        return Path(common_data) / "DailyGames" / "workers"
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _path_grants_access(
+    path: Path, desired_access: int, *, directory: bool,
+) -> bool | None:
+    """只读探测当前 token 是否取得指定存取权；未知错误回 ``None``。"""
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        create_file.restype = ctypes.c_void_p
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [ctypes.c_void_p]
+        close_handle.restype = ctypes.c_int
+        ctypes.set_last_error(0)
+        handle = create_file(
+            os.fspath(path),
+            desired_access,
+            FILE_SHARE_ALL,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS if directory else 0,
+            None,
+        )
+        if handle == INVALID_HANDLE_VALUE:
+            return False if ctypes.get_last_error() == ERROR_ACCESS_DENIED else None
+        if handle is None:
+            return None
+        close_handle(handle)
+        return True
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _launcher_worker_security_is_valid(worker_path: Path) -> bool:
+    """拒绝重解析点及当前普通 token 可修改的 worker 路径。"""
+    if not IS_WINDOWS:
+        return False
+    worker_root = _protected_launcher_worker_root()
+    if worker_root is None:
+        return False
+    try:
+        expected_root = Path(os.path.abspath(worker_root))
+        candidate = Path(os.path.abspath(worker_path))
+        if candidate.parent != expected_root:
+            return False
+        if candidate.name not in {
+            "launcher_automation_Arknights.ps1",
+            "launcher_automation_Endfield.ps1",
+        }:
+            return False
+        product_root = expected_root.parent
+        log_root = product_root / "logs"
+        for item in (product_root, expected_root, log_root, candidate):
+            stat_result = os.lstat(item)
+            if (
+                getattr(stat_result, "st_file_attributes", 0)
+                & FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                return False
+        probes = (
+            (product_root, _DIRECTORY_MUTATION_RIGHTS, True),
+            (expected_root, _DIRECTORY_MUTATION_RIGHTS, True),
+            (log_root, _DIRECTORY_MUTATION_RIGHTS, True),
+            (candidate, _FILE_MUTATION_RIGHTS, False),
+        )
+        for path, access_rights, is_directory in probes:
+            for access in access_rights:
+                granted = _path_grants_access(
+                    path, access, directory=is_directory,
+                )
+                if granted is not False:
+                    return False
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def _launcher_worker_contract(target_process: str) -> tuple[Path, str] | None:
-    """返回目标游戏对应的根目录包装脚本及精确任务参数。"""
+    """返回目标游戏对应的受保护包装脚本及精确任务参数。"""
     target_name = Path(target_process).name.casefold()
     worker_names = {
         "arknights.exe": "Arknights",
@@ -585,11 +1038,12 @@ def _launcher_worker_contract(target_process: str) -> tuple[Path, str] | None:
     process_stem = worker_names.get(target_name)
     if process_stem is None:
         return None
-    worker_path = (
-        Path(__file__).resolve().parent.parent
-        / ".generated"
-        / f"launcher_automation_{process_stem}.ps1"
-    )
+    worker_root = _protected_launcher_worker_root()
+    if worker_root is None:
+        return None
+    worker_path = worker_root / f"launcher_automation_{process_stem}.ps1"
+    if not _launcher_worker_security_is_valid(worker_path):
+        return None
     try:
         worker_sha256 = hashlib.sha256(worker_path.read_bytes()).hexdigest().upper()
     except OSError:
@@ -612,13 +1066,13 @@ def _launcher_worker_contract(target_process: str) -> tuple[Path, str] | None:
 def _read_launcher_worker_metadata(
     worker_path: Path,
 ) -> dict[str, object] | None:
-    """读取根目录包装脚本中唯一的版本化脱敏元数据。"""
+    """读取受保护包装脚本中唯一的版本化脱敏元数据。"""
     try:
         source = worker_path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError):
         return None
 
-    marker_prefix = "# DAILY_GAMES_LAUNCHER_WORKER_V3="
+    marker_prefix = "# DAILY_GAMES_LAUNCHER_WORKER_V4="
     markers = [
         line[len(marker_prefix):]
         for line in source.splitlines()
@@ -637,6 +1091,7 @@ def _read_launcher_worker_metadata(
         "working_directory",
         "arguments",
         "target_process",
+        "target_executable",
     }:
         return None
     return metadata
@@ -658,19 +1113,180 @@ def _decode_schtasks_xml(payload: bytes) -> str:
     raise UnicodeError("无法解码 schtasks XML 输出")
 
 
+@lru_cache(maxsize=1)
+def _windows_system_directory() -> Path | None:
+    """通过 Win32 API 取得系统目录，不信任可被继承修改的环境变量。"""
+    if not IS_WINDOWS:
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_system_directory = kernel32.GetSystemDirectoryW
+        get_system_directory.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+        get_system_directory.restype = ctypes.c_uint32
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = int(get_system_directory(buffer, len(buffer)))
+        if length <= 0 or length >= len(buffer):
+            return None
+        directory = Path(buffer.value)
+        return directory if directory.is_dir() else None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _windows_system_file(*parts: str) -> Path | None:
+    """取得系统目录下的既存文件；任何异常都失败关闭。"""
+    root = _windows_system_directory()
+    if root is None or not parts:
+        return None
+    try:
+        if any(
+            not part
+            or Path(part).is_absolute()
+            or any(piece in {"", ".", ".."} for piece in Path(part).parts)
+            for part in parts
+        ):
+            return None
+        candidate = root.joinpath(*parts)
+        return candidate if candidate.is_file() else None
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _native_current_user_sid() -> str | None:
+    """直接从当前 Windows token 读取 SID，不启动 PATH 中的外部程序。"""
+    if not IS_WINDOWS:
+        return None
+    token = ctypes.c_void_p()
+    sid_text = ctypes.c_void_p()
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+
+        class _SidAndAttributes(ctypes.Structure):
+            _fields_ = [
+                ("Sid", ctypes.c_void_p),
+                ("Attributes", ctypes.c_uint32),
+            ]
+
+        class _TokenUser(ctypes.Structure):
+            _fields_ = [("User", _SidAndAttributes)]
+
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+        advapi32.OpenProcessToken.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        advapi32.OpenProcessToken.restype = ctypes.c_int
+        advapi32.GetTokenInformation.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        advapi32.GetTokenInformation.restype = ctypes.c_int
+        advapi32.ConvertSidToStringSidW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        advapi32.ConvertSidToStringSidW.restype = ctypes.c_int
+
+        if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(),
+            0x0008,  # TOKEN_QUERY
+            ctypes.byref(token),
+        ):
+            return None
+        required = ctypes.c_uint32()
+        advapi32.GetTokenInformation(
+            token,
+            1,  # TokenUser
+            None,
+            0,
+            ctypes.byref(required),
+        )
+        if required.value <= 0:
+            return None
+        buffer = ctypes.create_string_buffer(required.value)
+        if not advapi32.GetTokenInformation(
+            token,
+            1,
+            buffer,
+            required.value,
+            ctypes.byref(required),
+        ):
+            return None
+        token_user = ctypes.cast(
+            buffer,
+            ctypes.POINTER(_TokenUser),
+        ).contents
+        if not token_user.User.Sid or not advapi32.ConvertSidToStringSidW(
+            token_user.User.Sid,
+            ctypes.byref(sid_text),
+        ):
+            return None
+        value = ctypes.wstring_at(sid_text.value)
+        return value if re.fullmatch(r"S-\d+(?:-\d+)+", value) else None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    finally:
+        if sid_text.value:
+            try:
+                kernel32.LocalFree(sid_text)
+            except (AttributeError, OSError):
+                pass
+        if token.value:
+            try:
+                kernel32.CloseHandle(token)
+            except (AttributeError, OSError):
+                pass
+
+
+@lru_cache(maxsize=1)
+def _current_user_sid() -> str | None:
+    """读取当前 token 的 SID；无法明确取得时失败关闭。"""
+    return _native_current_user_sid()
+
+
 def _run_schtasks(
     arguments: Sequence[str], *, capture_output: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
-    command = ["schtasks.exe", *[str(value) for value in arguments]]
+    executable = _windows_system_file("schtasks.exe")
+    command = [
+        str(executable) if executable is not None else "<schtasks-unavailable>",
+        *[str(value) for value in arguments],
+    ]
+    if executable is None:
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            stdout=b"",
+            stderr=b"Windows system schtasks.exe is unavailable",
+        )
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
-    return subprocess.run(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE if capture_output else subprocess.DEVNULL,
-        stderr=subprocess.PIPE if capture_output else subprocess.DEVNULL,
-        creationflags=creationflags,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if capture_output else subprocess.DEVNULL,
+            stderr=subprocess.PIPE if capture_output else subprocess.DEVNULL,
+            creationflags=creationflags,
+            check=False,
+            timeout=SCHTASKS_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            stdout=b"",
+            stderr=str(exc).encode("utf-8", errors="replace"),
+        )
 
 
 def _terminate_pid(pid: int, grace_s: float) -> bool:
@@ -683,44 +1299,56 @@ def _terminate_pid(pid: int, grace_s: float) -> bool:
         except (OSError, ProcessLookupError):
             return False
 
-    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    user32 = _user32_window_api()
+    kernel32 = _kernel32_process_api()
+    if kernel32 is None:
+        return False
 
     # 1. 对所有属于 pid 的可见窗口送 WM_CLOSE
     WM_CLOSE = 0x0010
 
-    @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)  # type: ignore[attr-defined]
+    @_WindowEnumProc
     def close_proc(hwnd: int, lparam: int) -> int:
         wpid = ctypes.c_uint32()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
-        if int(wpid.value) == pid and user32.IsWindowVisible(hwnd):
-            user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+        if user32 is not None:
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+            if int(wpid.value) == pid and user32.IsWindowVisible(hwnd):
+                user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
         return 1
 
-    user32.EnumWindows(close_proc, 0)
+    if user32 is not None:
+        user32.EnumWindows(close_proc, 0)
 
     # 2. 等待 grace_s
     deadline = time.monotonic() + max(0.0, grace_s)
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     while time.monotonic() < deadline:
+        ctypes.set_last_error(0)
         handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
-            return True  # 已结束
+            if ctypes.get_last_error() == ERROR_INVALID_PARAMETER:
+                return True
+            time.sleep(0.2)
+            continue
         exit_code = ctypes.c_uint32()
         got = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
         kernel32.CloseHandle(handle)
-        if got and exit_code.value != 259:
+        if got and exit_code.value != STILL_ACTIVE:
             return True
         time.sleep(0.2)
 
     # 3. 强制结束
-    PROCESS_TERMINATE = 0x0001
-    handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+    ctypes.set_last_error(0)
+    handle = kernel32.OpenProcess(
+        PROCESS_TERMINATE | SYNCHRONIZE,
+        False,
+        pid,
+    )
     if not handle:
-        return True  # 已结束或无权限，视为已不在
+        return ctypes.get_last_error() == ERROR_INVALID_PARAMETER
     try:
-        ok = bool(kernel32.TerminateProcess(handle, 1))
-        return ok
+        terminated = bool(kernel32.TerminateProcess(handle, 1))
+        wait_ms = TERMINATE_WAIT_MS if terminated else 0
+        return kernel32.WaitForSingleObject(handle, wait_ms) == WAIT_OBJECT_0
     finally:
         kernel32.CloseHandle(handle)
 

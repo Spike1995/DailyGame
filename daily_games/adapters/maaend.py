@@ -106,6 +106,11 @@ class MaaEndAdapter(AdapterBase):
                     if bool(self._start_button_automation.get("enabled", False))
                     else ""
                 ),
+                expected_wrapper_executable=(
+                    str(self._game_cfg.get("game_executable", ""))
+                    if bool(self._start_button_automation.get("enabled", False))
+                    else ""
+                ),
             ):
                 problems.append("终末地启动器管理员计划任务不存在或定义不匹配")
             details["game_administrator_task"] = (
@@ -188,8 +193,12 @@ class MaaEndAdapter(AdapterBase):
         if not lex or not Path(str(lex)).is_file():
             return StepResult(False, CODE_ENV_NOT_READY, "启动器可执行文件不存在", {})
         game_name = str(self._game_cfg.get("game_process_name", "Endfield.exe"))
+        game_path = str(self._game_cfg.get("game_executable", ""))
         self._baseline_game_pids = {
-            rec.pid for rec in self._pm.find_by_executable(game_name)
+            rec.pid
+            for rec in self._pm.find_by_executable(
+                game_name, expected_path=game_path
+            )
         }
         command = [str(lex)] + [str(a) for a in args]
         if bool(self._launcher.get("requires_administrator", False)):
@@ -233,7 +242,13 @@ class MaaEndAdapter(AdapterBase):
 
     def wait_game_ready(self, timeout_s: float, stop_event: object | None = None) -> StepResult:
         name = str(self._game_cfg.get("game_process_name", "Endfield.exe"))
-        recs = self._pm.wait_for_process(name, timeout_s, stop_event)
+        game_path = str(self._game_cfg.get("game_executable", ""))
+        recs = self._pm.wait_for_process(
+            name,
+            timeout_s,
+            stop_event,
+            expected_path=game_path,
+        )
         if _stop_requested(stop_event):
             return StepResult(False, CODE_STOP_REQUESTED, "等待游戏进程时收到停止要求", {})
         if not recs:
@@ -248,7 +263,13 @@ class MaaEndAdapter(AdapterBase):
                 {"pids": [rec.pid for rec in recs]},
             )
         for rec in new_records:
-            claimed = self._pm.take_ownership(rec.pid)
+            claimed = self._pm.take_ownership(
+                rec.pid,
+                expected_path=game_path,
+                expected_create_time=(
+                    rec.create_time if rec.create_time > 0.0 else None
+                ),
+            )
             if claimed is None:
                 return StepResult(
                     False,
@@ -261,7 +282,12 @@ class MaaEndAdapter(AdapterBase):
         # 进一步等待主窗口（window_regex=Endfield，已验证）
         title_regex = self._game_cfg.get("game_window_title_regex")
         if title_regex:
-            wins = self._pm.wait_for_window(recs[0].pid, timeout_s, stop_event, title_regex=str(title_regex))
+            wins = self._pm.wait_for_window(
+                new_records[0].pid,
+                timeout_s,
+                stop_event,
+                title_regex=str(title_regex),
+            )
             if _stop_requested(stop_event):
                 return StepResult(False, CODE_STOP_REQUESTED, "等待窗口时收到停止要求", {})
             if not wins:
@@ -325,7 +351,12 @@ class MaaEndAdapter(AdapterBase):
                 self._helper.get("scheduled_task_start_timeout_s", 30.0)
             )
             records = list(
-                self._pm.wait_for_process(helper_name, start_timeout, None)
+                self._pm.wait_for_process(
+                    helper_name,
+                    start_timeout,
+                    None,
+                    expected_path=str(self._helper.get("executable", "")),
+                )
             )
             if not records:
                 return StepResult(
@@ -373,7 +404,12 @@ class MaaEndAdapter(AdapterBase):
             )
 
         helper_name = str(self._helper.get("process_name", "MaaEnd.exe"))
-        helper_recs = list(self._pm.find_by_executable(helper_name))
+        helper_recs = list(
+            self._pm.find_by_executable(
+                helper_name,
+                expected_path=str(self._helper.get("executable", "")),
+            )
+        )
         helper_pids = {rec.pid for rec in helper_recs}
         if self._started_helper_pid is not None:
             # MaaEnd 可能在 start_helper 与本阶段之间极快完成；启动阶段记录的

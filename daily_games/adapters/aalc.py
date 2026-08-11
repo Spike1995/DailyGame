@@ -192,7 +192,13 @@ class AalcAdapter(AdapterBase):
 
     def wait_game_ready(self, timeout_s: float, stop_event: object | None = None) -> StepResult:
         name = str(self._game_cfg.get("game_process_name", "LimbusCompany.exe"))
-        recs = self._pm.wait_for_process(name, timeout_s, stop_event)
+        game_path = str(self._game_cfg.get("game_executable", ""))
+        recs = self._pm.wait_for_process(
+            name,
+            timeout_s,
+            stop_event,
+            expected_path=game_path,
+        )
         if _stop_requested(stop_event):
             return StepResult(False, CODE_STOP_REQUESTED, "等待游戏进程时收到停止要求", {})
         if not recs:
@@ -241,7 +247,12 @@ class AalcAdapter(AdapterBase):
                 self._helper.get("scheduled_task_start_timeout_s", 30.0)
             )
             records = list(
-                self._pm.wait_for_process(helper_name, start_timeout, None)
+                self._pm.wait_for_process(
+                    helper_name,
+                    start_timeout,
+                    None,
+                    expected_path=str(self._helper.get("executable", "")),
+                )
             )
             if not records:
                 return StepResult(
@@ -294,9 +305,15 @@ class AalcAdapter(AdapterBase):
 
         game_name = str(self._game_cfg.get("game_process_name", "LimbusCompany.exe"))
         helper_name = str(self._helper.get("process_name", "AALC.exe"))
+        game_path = str(self._game_cfg.get("game_executable", ""))
+        helper_path = str(self._helper.get("executable", ""))
 
-        game_recs = self._pm.find_by_executable(game_name)
-        helper_recs = self._pm.find_by_executable(helper_name)
+        game_recs = self._pm.find_by_executable(
+            game_name, expected_path=game_path
+        )
+        helper_recs = self._pm.find_by_executable(
+            helper_name, expected_path=helper_path
+        )
         if not game_recs and not helper_recs:
             return StepResult(
                 False, CODE_HELPER_EXITED_EARLY,

@@ -40,9 +40,97 @@ STATE_SKIPPED = "skipped"
 STATE_STOPPING = "stopping"
 STATE_STOPPED = "stopped"
 
-_SENSITIVE_LOG_VALUE = re.compile(
-    r"(?i)\b(token|secret|password|passwd|api[_-]?key|authorization)\s*[:=]\s*\S+"
+_REDACTED_LOG_VALUE = "<已脱敏>"
+_SENSITIVE_LOG_NAME = (
+    r"(?:access[_-]?token|refresh[_-]?token|client[_-]?secret|token|secret|"
+    r"password|passwd|api[_-]?key)"
 )
+_LOG_VALUE = (
+    r'(?:(?:"(?:\\.|[^"\\\r\n])*")'
+    r"|(?:'(?:\\.|[^'\\\r\n])*')"
+    r'|(?:[^,\s"\'\}\]\r\n]+))'
+)
+_AUTHORIZATION_VALUE = (
+    r'(?:(?:"(?:\\.|[^"\\\r\n])*")'
+    r"|(?:'(?:\\.|[^'\\\r\n])*')"
+    r'|(?:(?:bearer|basic)\s+[^,\s"\'\}\]\r\n]+)'
+    r'|(?:[^,\s"\'\}\]\r\n]+))'
+)
+_AUTHORIZATION_ASSIGNMENT = re.compile(
+    rf"(?i)(\bauthorization\b[\"']?\s*[:=]\s*){_AUTHORIZATION_VALUE}"
+)
+_AUTHORIZATION_FLAG = re.compile(
+    rf"(?i)((?<!\w)(?:--?|/)authorization\b(?:\s+|=))"
+    rf"{_AUTHORIZATION_VALUE}"
+)
+_SENSITIVE_LOG_ASSIGNMENT = re.compile(
+    rf"(?i)(\b{_SENSITIVE_LOG_NAME}\b[\"']?\s*[:=]\s*){_LOG_VALUE}"
+)
+_SENSITIVE_LOG_FLAG = re.compile(
+    rf"(?i)((?<!\w)(?:--?|/){_SENSITIVE_LOG_NAME}\b(?:\s+|=))"
+    rf"{_LOG_VALUE}"
+)
+
+
+def _is_sensitive_log_key(value: object) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(value).casefold())
+    return (
+        normalized == "authorization"
+        or normalized.endswith("token")
+        or normalized.endswith("secret")
+        or normalized.endswith("password")
+        or normalized.endswith("passwd")
+        or normalized.endswith("apikey")
+    )
+
+
+def _is_sensitive_command_flag(value: str) -> bool:
+    match = re.fullmatch(r"(?:--?|/)([A-Za-z0-9_-]+)", value.strip())
+    return bool(match and _is_sensitive_log_key(match.group(1)))
+
+
+def _redact_log_text(value: object) -> str:
+    text = str(value)
+    text = _AUTHORIZATION_ASSIGNMENT.sub(
+        rf"\1{_REDACTED_LOG_VALUE}", text,
+    )
+    text = _AUTHORIZATION_FLAG.sub(
+        rf"\1{_REDACTED_LOG_VALUE}", text,
+    )
+    text = _SENSITIVE_LOG_ASSIGNMENT.sub(
+        rf"\1{_REDACTED_LOG_VALUE}", text,
+    )
+    return _SENSITIVE_LOG_FLAG.sub(
+        rf"\1{_REDACTED_LOG_VALUE}", text,
+    )
+
+
+def _redact_log_value(value: object, *, force: bool = False) -> object:
+    """递归遮罩日志证据，同时处理命令列的旗标和值分离形式。"""
+    if force:
+        return _REDACTED_LOG_VALUE
+    if isinstance(value, Mapping):
+        return {
+            key: _redact_log_value(item, force=_is_sensitive_log_key(key))
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        redacted: list[object] = []
+        redact_next = False
+        for item in value:
+            if redact_next:
+                redacted.append(_REDACTED_LOG_VALUE)
+                redact_next = False
+                continue
+            if isinstance(item, str) and _is_sensitive_command_flag(item):
+                redacted.append(item)
+                redact_next = True
+                continue
+            redacted.append(_redact_log_value(item))
+        return tuple(redacted) if isinstance(value, tuple) else redacted
+    if isinstance(value, str):
+        return _redact_log_text(value)
+    return value
 
 
 def _now_iso() -> str:
@@ -460,7 +548,7 @@ class DailyOrchestrator:
         stopped = False
         last_success: _StepFailure | Any = _StepFailure(True, "ok", "任务完成", {})
         game_ready_timeout = self._game_ready_timeout(config)
-        completion_timeout = self._timeout(config, "completion_s")
+        completion_timeout = self._game_timeout(config, game_id, "completion_s")
         cleanup_timeout = self._timeout(config, "cleanup_s")
 
         self._transition(game_id, STATE_CHECKING, "正在确认没有其他受管游戏或助手运行。")
@@ -1092,17 +1180,17 @@ class DailyOrchestrator:
         ))
 
     def _log_step_evidence(self, game_id: str, method_name: str, result: Any) -> None:
-        """记录安全的运行证据，不序列化配置内容。
+        """记录经过结构化遮罩的最小运行证据。
 
         适配器 ``details`` 可能包含任意诊断数据，其中也可能有源自配置的值。
-        因此本方法只允许记录运行日志契约要求的进程 ID 和启动命令。
+        本方法只允许进程 ID 和启动命令，并在格式化前递归遮罩敏感值。
         """
         fields: dict[str, object] = {}
         details = getattr(result, "details", {})
         if isinstance(details, Mapping):
             for key in ("pid", "pids", "command"):
                 if key in details:
-                    fields[key] = details[key]
+                    fields[key] = _redact_log_value(details[key])
         suffix = f" 证据={fields!r}" if fields else ""
         self._log(
             "info",
@@ -1115,6 +1203,25 @@ class DailyOrchestrator:
         # 窗口专用值时，回退到进程时间预算。
         timeout = self._timeout(config, "game_window_s")
         return timeout if timeout > 0 else self._timeout(config, "game_process_s")
+
+    def _game_timeout(
+        self,
+        config: Mapping[str, object],
+        game_id: str,
+        key: str,
+    ) -> float:
+        """优先使用单款游戏的超时配置，再回退到全局值。"""
+        games = config.get("games", {})
+        if isinstance(games, Mapping):
+            game = games.get(game_id, {})
+            if isinstance(game, Mapping):
+                timeouts = game.get("timeouts", {})
+                if isinstance(timeouts, Mapping) and key in timeouts:
+                    try:
+                        return max(0.0, float(timeouts[key]))
+                    except (TypeError, ValueError):
+                        pass
+        return self._timeout(config, key)
 
     @staticmethod
     def _timeout(config: Mapping[str, object], key: str) -> float:
@@ -1147,7 +1254,7 @@ class DailyOrchestrator:
 
     def _log(self, level: str, message: str) -> None:
         """记录状态证据，同时过滤疑似凭据值。"""
-        safe_message = _SENSITIVE_LOG_VALUE.sub(r"\1=<已脱敏>", str(message))
+        safe_message = _redact_log_text(message)
         method = getattr(self._logger, level, None)
         if callable(method):
             try:

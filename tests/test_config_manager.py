@@ -7,9 +7,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from daily_games.config_manager import (
     CODE_CHANGE_DUPLICATE,
@@ -497,6 +500,24 @@ class TestApplyChanges(unittest.TestCase):
             self.assertFalse(results[0].ok)
             self.assertEqual(results[0].code, CODE_CHANGE_UNKNOWN)
 
+    def test_apply_rejects_entire_batch_when_one_id_is_unknown(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            p = _make_user_config(tmp)
+            maa_path = tmp / "maa_config" / "gui.new.json"
+            before = maa_path.read_bytes()
+            backups = tmp / "b"
+            cm = ConfigManager(p, backups)
+
+            results = cm.apply_required_changes([
+                "maa.autorun",
+                "does.not.exist",
+            ])
+
+            self.assertTrue(any(r.code == CODE_CHANGE_UNKNOWN for r in results))
+            self.assertEqual(maa_path.read_bytes(), before)
+            self.assertFalse(backups.exists())
+
     def test_apply_rejects_duplicate_id(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -581,6 +602,180 @@ class TestApplyChanges(unittest.TestCase):
             content = (tmp / "aalc_config.yaml").read_text(encoding="utf-8")
             self.assertIn("autostart: false", content)
 
+    def test_multi_file_apply_commits_all_files_and_cleans_stages(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            config_path = _make_user_config(tmp)
+            maa_path = tmp / "maa_config" / "gui.new.json"
+            aalc_path = tmp / "aalc_config.yaml"
+            cm = ConfigManager(config_path, tmp / "b")
+
+            results = cm.apply_required_changes([
+                "maa.autorun",
+                "aalc.autostart",
+            ])
+
+            self.assertTrue(all(result.ok for result in results))
+            maa = json.loads(maa_path.read_text(encoding="utf-8"))
+            self.assertTrue(
+                maa["Configurations"]["Default"]["Gui"]
+                ["StartUpSettings"]["RunDirectly"]
+            )
+            self.assertIn(
+                "autostart: false",
+                aalc_path.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(list(tmp.rglob(".daily_games_apply_*")), [])
+
+    def test_multi_file_stage_failure_leaves_all_originals_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            config_path = _make_user_config(tmp)
+            maa_path = tmp / "maa_config" / "gui.new.json"
+            aalc_path = tmp / "aalc_config.yaml"
+            maa_before = maa_path.read_bytes()
+            aalc_before = aalc_path.read_bytes()
+            cm = ConfigManager(config_path, tmp / "b")
+            import daily_games.config_manager as cm_mod
+
+            real_atomic_write = cm_mod._atomic_write_text
+
+            def fail_aalc_write(target, text, encoding="utf-8"):
+                target_path = Path(target)
+                if (
+                    target_path.name == aalc_path.name
+                    and target_path.parent.name.startswith(".daily_games_apply_")
+                ):
+                    raise OSError("模拟 AALC 写入失败")
+                return real_atomic_write(target, text, encoding)
+
+            with mock.patch.object(
+                cm_mod,
+                "_atomic_write_text",
+                side_effect=fail_aalc_write,
+            ):
+                results = cm.apply_required_changes([
+                    "maa.autorun",
+                    "aalc.autostart",
+                ])
+
+            rollback = [result for result in results if result.name == "apply.rollback"]
+            self.assertTrue(rollback and rollback[-1].ok)
+            self.assertEqual(maa_path.read_bytes(), maa_before)
+            self.assertEqual(aalc_path.read_bytes(), aalc_before)
+            self.assertEqual(list(tmp.rglob(".daily_games_apply_*")), [])
+
+    def test_multi_file_commit_failure_rolls_back_only_committed_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            config_path = _make_user_config(tmp)
+            maa_path = tmp / "maa_config" / "gui.new.json"
+            aalc_path = tmp / "aalc_config.yaml"
+            maa_before = maa_path.read_bytes()
+            aalc_before = aalc_path.read_bytes()
+            cm = ConfigManager(config_path, tmp / "b")
+            import daily_games.config_manager as cm_mod
+
+            real_replace = cm_mod.os.replace
+            failure_injected = False
+
+            def fail_second_commit(source, destination):
+                nonlocal failure_injected
+                source_path = Path(source)
+                destination_path = Path(destination).resolve()
+                if (
+                    not failure_injected
+                    and destination_path == aalc_path.resolve()
+                    and source_path.parent.name.startswith(".daily_games_apply_")
+                    and not source_path.name.startswith(".rollback_")
+                ):
+                    failure_injected = True
+                    raise OSError("模拟第二档提交失败")
+                return real_replace(source, destination)
+
+            with mock.patch.object(
+                cm_mod.os,
+                "replace",
+                side_effect=fail_second_commit,
+            ):
+                results = cm.apply_required_changes([
+                    "maa.autorun",
+                    "aalc.autostart",
+                ])
+
+            self.assertTrue(failure_injected)
+            commit = [result for result in results if result.name == "apply.commit"]
+            rollback = [result for result in results if result.name == "apply.rollback"]
+            self.assertTrue(commit and not commit[-1].ok)
+            self.assertTrue(rollback and rollback[-1].ok)
+            self.assertEqual(rollback[-1].details["committed_count"], 1)
+            self.assertEqual(maa_path.read_bytes(), maa_before)
+            self.assertEqual(aalc_path.read_bytes(), aalc_before)
+            self.assertEqual(list(tmp.rglob(".daily_games_apply_*")), [])
+
+    def test_external_change_before_commit_aborts_without_overwriting_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            config_path = _make_user_config(tmp)
+            maa_path = tmp / "maa_config" / "gui.new.json"
+            aalc_path = tmp / "aalc_config.yaml"
+            maa_before = maa_path.read_bytes()
+            aalc_external = aalc_path.read_bytes() + b"# external change\n"
+            cm = ConfigManager(config_path, tmp / "b")
+
+            real_apply = cm._apply_specs_to_one_file
+
+            def apply_then_change_original(target, specs, cfg):
+                staged_results = real_apply(target, specs, cfg)
+                target_path = Path(target)
+                if (
+                    target_path.name == aalc_path.name
+                    and target_path.parent.name.startswith(".daily_games_apply_")
+                ):
+                    aalc_path.write_bytes(aalc_external)
+                return staged_results
+
+            with mock.patch.object(
+                cm,
+                "_apply_specs_to_one_file",
+                side_effect=apply_then_change_original,
+            ):
+                results = cm.apply_required_changes([
+                    "maa.autorun",
+                    "aalc.autostart",
+                ])
+
+            concurrent = [
+                result
+                for result in results
+                if result.name == "apply.concurrent_change"
+            ]
+            rollback = [result for result in results if result.name == "apply.rollback"]
+            self.assertTrue(concurrent and not concurrent[-1].ok)
+            self.assertTrue(rollback and rollback[-1].ok)
+            self.assertEqual(maa_path.read_bytes(), maa_before)
+            self.assertEqual(aalc_path.read_bytes(), aalc_external)
+            self.assertEqual(list(tmp.rglob(".daily_games_apply_*")), [])
+
+    def test_unexpected_prepare_error_is_reported_without_writing(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            config_path = _make_user_config(tmp)
+            maa_path = tmp / "maa_config" / "gui.new.json"
+            before = maa_path.read_bytes()
+            cm = ConfigManager(config_path, tmp / "b")
+
+            with mock.patch.object(
+                cm,
+                "backup_files",
+                side_effect=RuntimeError("模拟非预期错误"),
+            ):
+                results = cm.apply_required_changes(["maa.autorun"])
+
+            prepare = [result for result in results if result.name == "apply.prepare"]
+            self.assertTrue(prepare and not prepare[-1].ok)
+            self.assertEqual(maa_path.read_bytes(), before)
+
 
 class TestBackupRestore(unittest.TestCase):
     def test_backup_creates_manifest_with_hashes(self):
@@ -606,6 +801,60 @@ class TestBackupRestore(unittest.TestCase):
             with self.assertRaises(ConfigManagerError) as ctx:
                 cm.backup_files([str(tmp / "nope.txt")])
             self.assertEqual(ctx.exception.code, CODE_FILE_NOT_FOUND)
+
+    def test_backup_rejects_non_plain_source(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = tmp / "a.json"
+            src.write_text("hello", encoding="utf-8")
+            cm = ConfigManager(tmp / "u.json", tmp / "b")
+
+            with mock.patch(
+                "daily_games.config_manager._is_plain_file",
+                return_value=False,
+            ):
+                with self.assertRaises(ConfigManagerError) as ctx:
+                    cm.backup_files([src])
+
+            self.assertEqual(ctx.exception.code, CODE_FILE_NOT_FOUND)
+            self.assertFalse((tmp / "b").exists())
+
+    def test_backup_checks_lexical_source_before_path_resolution(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            source = tmp / "source.json"
+            alias = tmp / "alias.json"
+            source.write_text("source", encoding="utf-8")
+            alias.write_text("alias", encoding="utf-8")
+            cm = ConfigManager(tmp / "u.json", tmp / "b")
+            real_resolve = Path.resolve
+            real_lstat = os.lstat
+
+            def resolve_alias(path, *args, **kwargs):
+                if path == alias:
+                    return source
+                return real_resolve(path, *args, **kwargs)
+
+            def mark_alias_as_link(path, *args, **kwargs):
+                result = real_lstat(path, *args, **kwargs)
+                if Path(path) != alias:
+                    return result
+                values = list(result)
+                values[0] = stat.S_IFLNK | 0o777
+                return os.stat_result(values)
+
+            with (
+                mock.patch.object(Path, "resolve", new=resolve_alias),
+                mock.patch(
+                    "daily_games.config_manager.os.lstat",
+                    side_effect=mark_alias_as_link,
+                ),
+            ):
+                with self.assertRaises(ConfigManagerError) as ctx:
+                    cm.backup_files([alias])
+
+            self.assertEqual(ctx.exception.code, CODE_FILE_NOT_FOUND)
+            self.assertFalse((tmp / "b").exists())
 
     def test_backup_hash_mismatch_on_corrupt_copy(self):
         # 通过 monkeypatch shutil.copy2 模拟复制后内容不符
@@ -633,6 +882,21 @@ class TestBackupRestore(unittest.TestCase):
             # 部分备份目录应被清理
             self.assertFalse((tmp / "b").exists() and any((tmp / "b").iterdir()))
 
+    def test_backup_manifest_write_failure_cleans_destination(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = tmp / "a.json"
+            src.write_text("hello", encoding="utf-8")
+            cm = ConfigManager(tmp / "u.json", tmp / "b")
+            with mock.patch(
+                "daily_games.config_manager._atomic_write_text",
+                side_effect=OSError("磁盘写入失败"),
+            ):
+                with self.assertRaises(OSError):
+                    cm.backup_files([src])
+
+            self.assertFalse((tmp / "b").exists() and any((tmp / "b").iterdir()))
+
     def test_restore_backs_up_current_then_restores(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -658,6 +922,238 @@ class TestBackupRestore(unittest.TestCase):
             self.assertFalse(results[0].ok)
             self.assertEqual(results[0].code, CODE_FILE_NOT_FOUND)
 
+    def test_list_backups_handles_root_enumeration_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            backups = tmp / "b"
+            backups.mkdir()
+            cm = ConfigManager(tmp / "u.json", backups)
+
+            with mock.patch.object(
+                Path,
+                "iterdir",
+                side_effect=PermissionError("模拟无法读取备份目录"),
+            ):
+                self.assertEqual(cm.list_backups(), [])
+
+    def test_restore_reports_backup_lookup_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            backups = tmp / "b"
+            src = tmp / "a.json"
+            src.write_text("old", encoding="utf-8")
+            cm = ConfigManager(tmp / "u.json", backups)
+            info = cm.backup_files([src])
+
+            with mock.patch.object(
+                Path,
+                "iterdir",
+                side_effect=PermissionError("模拟无法读取备份目录"),
+            ):
+                results = cm.restore_backup(info.backup_id)
+
+            self.assertEqual(results[0].name, "restore.lookup")
+            self.assertFalse(results[0].ok)
+
+    def test_restore_reports_payload_read_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            backups = tmp / "b"
+            src = tmp / "a.json"
+            src.write_text("old", encoding="utf-8")
+            cm = ConfigManager(tmp / "u.json", backups)
+            info = cm.backup_files([src])
+            import daily_games.config_manager as cm_mod
+
+            real_sha256 = cm_mod._sha256
+
+            def fail_backup_payload(path):
+                candidate = Path(path)
+                if candidate.parent == info.manifest_path.parent:
+                    raise PermissionError("模拟无法读取备份副本")
+                return real_sha256(candidate)
+
+            with mock.patch.object(
+                cm_mod,
+                "_sha256",
+                side_effect=fail_backup_payload,
+            ):
+                results = cm.restore_backup(info.backup_id)
+
+            self.assertEqual(results[0].name, "restore.validate")
+            self.assertFalse(results[0].ok)
+
+    def test_restore_reports_pre_backup_os_error_without_writing(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            backups = tmp / "b"
+            src = tmp / "a.json"
+            src.write_text("old", encoding="utf-8")
+            cm = ConfigManager(tmp / "u.json", backups)
+            info = cm.backup_files([src])
+            src.write_text("current", encoding="utf-8")
+
+            with mock.patch.object(
+                cm,
+                "backup_files",
+                side_effect=PermissionError("模拟恢复前备份失败"),
+            ):
+                results = cm.restore_backup(info.backup_id)
+
+            self.assertEqual(results[-1].name, "restore.pre_backup")
+            self.assertFalse(results[-1].ok)
+            self.assertEqual(src.read_text(encoding="utf-8"), "current")
+
+    def test_restore_reports_unexpected_stage_error_and_cleans_temps(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            backups = tmp / "b"
+            src = tmp / "a.json"
+            src.write_text("old", encoding="utf-8")
+            cm = ConfigManager(tmp / "u.json", backups)
+            info = cm.backup_files([src])
+            src.write_text("current", encoding="utf-8")
+
+            real_copy2 = shutil.copy2
+
+            def fail_restore_stage(source, destination, *args, **kwargs):
+                if Path(destination).name.startswith(".restore_"):
+                    raise RuntimeError("模拟非预期暂存错误")
+                return real_copy2(source, destination, *args, **kwargs)
+
+            with mock.patch(
+                "daily_games.config_manager.shutil.copy2",
+                side_effect=fail_restore_stage,
+            ):
+                results = cm.restore_backup(info.backup_id)
+
+            summary = [r for r in results if r.name == "restore.summary"]
+            self.assertTrue(summary and not summary[-1].ok)
+            self.assertEqual(src.read_text(encoding="utf-8"), "current")
+            self.assertFalse(any(tmp.glob(".restore_new_*")))
+            self.assertFalse(any(tmp.glob(".restore_rollback_*")))
+
+    def test_restore_validates_all_entries_before_writing_any_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            backups = tmp / "b"
+            first = tmp / "first.json"
+            second = tmp / "second.json"
+            first.write_text("first-old", encoding="utf-8")
+            second.write_text("second-old", encoding="utf-8")
+            cm = ConfigManager(tmp / "u.json", backups)
+            info = cm.backup_files([first, second])
+            first.write_text("first-current", encoding="utf-8")
+            second.write_text("second-current", encoding="utf-8")
+            manifest = json.loads(info.manifest_path.read_text(encoding="utf-8"))
+            corrupt = info.manifest_path.parent / manifest["entries"][1]["backup_name"]
+            corrupt.write_text("corrupt", encoding="utf-8")
+
+            results = cm.restore_backup(info.backup_id)
+
+            self.assertFalse(any(r.name == "restore.summary" and r.ok for r in results))
+            self.assertEqual(first.read_text(encoding="utf-8"), "first-current")
+            self.assertEqual(second.read_text(encoding="utf-8"), "second-current")
+
+    def test_restore_rolls_back_committed_target_when_later_commit_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            backups = tmp / "b"
+            first = tmp / "first.json"
+            second = tmp / "second.json"
+            first.write_text("first-old", encoding="utf-8")
+            second.write_text("second-old", encoding="utf-8")
+            cm = ConfigManager(tmp / "u.json", backups)
+            info = cm.backup_files([first, second])
+            first.write_text("first-current", encoding="utf-8")
+            second.write_text("second-current", encoding="utf-8")
+
+            real_replace = os.replace
+
+            def fail_second_restore_commit(source, destination):
+                source_path = Path(source)
+                destination_path = Path(destination)
+                if (
+                    source_path.name.startswith(".restore_new_")
+                    and destination_path == second
+                ):
+                    raise OSError("模拟第二个目标提交失败")
+                return real_replace(source, destination)
+
+            with mock.patch(
+                "daily_games.config_manager.os.replace",
+                side_effect=fail_second_restore_commit,
+            ):
+                results = cm.restore_backup(info.backup_id)
+
+            rollback = next(r for r in results if r.name == "restore.rollback")
+            summary = next(r for r in results if r.name == "restore.summary")
+            self.assertTrue(rollback.ok)
+            self.assertFalse(summary.ok)
+            self.assertEqual(first.read_text(encoding="utf-8"), "first-current")
+            self.assertEqual(second.read_text(encoding="utf-8"), "second-current")
+            self.assertFalse(any(tmp.glob(".restore_new_*")))
+            self.assertFalse(any(tmp.glob(".restore_rollback_*")))
+
+    def test_restore_does_not_overwrite_external_change_after_commit(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            backups = tmp / "b"
+            src = tmp / "a.json"
+            src.write_text("backup-version", encoding="utf-8")
+            cm = ConfigManager(tmp / "u.json", backups)
+            info = cm.backup_files([src])
+            src.write_text("current-version", encoding="utf-8")
+            external = "external-after-commit"
+            real_replace = os.replace
+
+            def change_after_restore_commit(source, destination):
+                result = real_replace(source, destination)
+                source_path = Path(source)
+                destination_path = Path(destination)
+                if (
+                    source_path.name.startswith(".restore_new_")
+                    and destination_path == src
+                ):
+                    src.write_text(external, encoding="utf-8")
+                return result
+
+            with mock.patch(
+                "daily_games.config_manager.os.replace",
+                side_effect=change_after_restore_commit,
+            ):
+                results = cm.restore_backup(info.backup_id)
+
+            rollback = next(r for r in results if r.name == "restore.rollback")
+            summary = next(r for r in results if r.name == "restore.summary")
+            self.assertFalse(rollback.ok)
+            self.assertFalse(summary.ok)
+            self.assertEqual(src.read_text(encoding="utf-8"), external)
+
+    def test_restore_rejects_manifest_backup_name_traversal(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            backups = tmp / "b"
+            src = tmp / "a.json"
+            outside = tmp / "outside.json"
+            src.write_text("old", encoding="utf-8")
+            outside.write_text("outside", encoding="utf-8")
+            cm = ConfigManager(tmp / "u.json", backups)
+            info = cm.backup_files([src])
+            src.write_text("current", encoding="utf-8")
+            manifest = json.loads(info.manifest_path.read_text(encoding="utf-8"))
+            manifest["entries"][0]["backup_name"] = "../outside.json"
+            info.manifest_path.write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+
+            results = cm.restore_backup(info.backup_id)
+
+            self.assertFalse(results[0].ok)
+            self.assertEqual(src.read_text(encoding="utf-8"), "current")
+            self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+
     def test_list_backups(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -669,6 +1165,47 @@ class TestBackupRestore(unittest.TestCase):
             cm.backup_files([str(src)])
             infos = cm.list_backups()
             self.assertEqual(len(infos), 2)
+
+    def test_list_backups_skips_malformed_manifest(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            backups = tmp / "b"
+            src = tmp / "a.json"
+            src.write_text("1", encoding="utf-8")
+            cm = ConfigManager(tmp / "u.json", backups)
+            valid = cm.backup_files([src])
+            malformed_dir = backups / "00000000T000000_badbad00"
+            malformed_dir.mkdir()
+            (malformed_dir / "manifest.json").write_text(
+                json.dumps({
+                    "backup_id": "badbad00",
+                    "created_at": [],
+                    "source_count": "not-an-integer",
+                    "entries": {},
+                }),
+                encoding="utf-8",
+            )
+
+            infos = cm.list_backups()
+
+            self.assertEqual([item.backup_id for item in infos], [valid.backup_id])
+
+    def test_duplicate_backup_id_is_hidden_and_restore_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            backups = tmp / "b"
+            src = tmp / "a.json"
+            src.write_text("old", encoding="utf-8")
+            cm = ConfigManager(tmp / "u.json", backups)
+            info = cm.backup_files([src])
+            duplicate = backups / f"20991231T235959_{info.backup_id}"
+            shutil.copytree(info.manifest_path.parent, duplicate)
+            src.write_text("current", encoding="utf-8")
+
+            self.assertEqual(cm.list_backups(), [])
+            results = cm.restore_backup(info.backup_id)
+            self.assertFalse(results[0].ok)
+            self.assertEqual(src.read_text(encoding="utf-8"), "current")
 
 
 class TestPatchJson(unittest.TestCase):
@@ -697,6 +1234,25 @@ class TestPatchJson(unittest.TestCase):
             # 文件未被改动
             self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"a": 1})
 
+    def test_patch_mixed_valid_and_missing_keys_rejects_entire_json_batch(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            target = tmp / "t.json"
+            target.write_text(
+                json.dumps({"a": {"b": 1}, "keep": True}, indent=2),
+                encoding="utf-8",
+            )
+            before = target.read_bytes()
+            cm = ConfigManager(tmp / "u.json", tmp / "b")
+
+            results = cm.patch_json(target, {
+                "a.b": 2,
+                "nonexistent.key": 3,
+            })
+
+            self.assertTrue(any(not result.ok for result in results))
+            self.assertEqual(target.read_bytes(), before)
+
     def test_patch_invalid_json_fails(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -712,6 +1268,23 @@ class TestPatchJson(unittest.TestCase):
             cm = ConfigManager(tmp / "u.json", tmp / "b")
             results = cm.patch_json(tmp / "nope.json", {"a": 1})
             self.assertEqual(results[0].code, CODE_FILE_NOT_FOUND)
+
+    def test_patch_reparse_point_is_rejected_before_json_read(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            target = tmp / "t.json"
+            target.write_text(json.dumps({"a": 1}), encoding="utf-8")
+            cm = ConfigManager(tmp / "u.json", tmp / "b")
+
+            with mock.patch(
+                "daily_games.config_manager._is_plain_file",
+                return_value=False,
+            ), mock.patch("builtins.open") as open_mock:
+                results = cm.patch_json(target, {"a": 2})
+
+            self.assertEqual(results[0].code, CODE_FILE_NOT_FOUND)
+            open_mock.assert_not_called()
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"a": 1})
 
     def test_patch_atomic_write_verify_failure_detects_corruption(self):
         # 模拟写入后验证失败（值不符）
@@ -766,6 +1339,26 @@ class TestPatchYaml(unittest.TestCase):
             results = cm.patch_yaml_scalars(target, {"nonexistent": "x"})
             self.assertEqual(results[0].code, CODE_KEY_MISSING)
 
+    def test_patch_mixed_valid_and_missing_keys_rejects_entire_yaml_batch(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            target = tmp / "c.yaml"
+            target.write_text(
+                "autostart: false\n"
+                "game_path: D:\\old.exe\n",
+                encoding="utf-8",
+            )
+            before = target.read_bytes()
+            cm = ConfigManager(tmp / "u.json", tmp / "b")
+
+            results = cm.patch_yaml_scalars(target, {
+                "autostart": "true",
+                "nonexistent": "x",
+            })
+
+            self.assertTrue(any(not result.ok for result in results))
+            self.assertEqual(target.read_bytes(), before)
+
     def test_patch_duplicate_key_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -802,6 +1395,23 @@ class TestPatchYaml(unittest.TestCase):
             cm = ConfigManager(tmp / "u.json", tmp / "b")
             results = cm.patch_yaml_scalars(tmp / "nope.yaml", {"a": "b"})
             self.assertEqual(results[0].code, CODE_FILE_NOT_FOUND)
+
+    def test_patch_reparse_point_is_rejected_before_yaml_read(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            target = tmp / "c.yaml"
+            target.write_text("autostart: false\n", encoding="utf-8")
+            cm = ConfigManager(tmp / "u.json", tmp / "b")
+
+            with mock.patch(
+                "daily_games.config_manager._is_plain_file",
+                return_value=False,
+            ), mock.patch("builtins.open") as open_mock:
+                results = cm.patch_yaml_scalars(target, {"autostart": "true"})
+
+            self.assertEqual(results[0].code, CODE_FILE_NOT_FOUND)
+            open_mock.assert_not_called()
+            self.assertEqual(target.read_text(encoding="utf-8"), "autostart: false\n")
 
 
 if __name__ == "__main__":

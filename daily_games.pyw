@@ -134,7 +134,16 @@ def _default_gui_error_reporter(message: str) -> None:
     if os.name != "nt":
         return
     try:
-        ctypes.windll.user32.MessageBoxW(None, message, "一键日常", 0x00000010)
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        message_box = user32.MessageBoxW
+        message_box.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+        ]
+        message_box.restype = ctypes.c_int
+        message_box(None, message, "一键日常", 0x00000010)
     except Exception:
         # 消息框不可用时，stderr 仍会收到诊断信息。
         pass

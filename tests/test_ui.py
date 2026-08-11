@@ -5,11 +5,15 @@ orchestrator.py；除最后的 Tk 冒烟测试外，所有案例都不需要显�
 """
 from __future__ import annotations
 
+import ctypes
+import json
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -30,6 +34,9 @@ from daily_games.ui import (  # noqa: E402
     AUTO_EXIT_SUCCESS_DELAY_MS,
     DailyGamesApp,
     STOP_EXIT_TIMEOUT_MS,
+    _enable_dark_title_bar,
+    _enable_dpi_awareness,
+    resolve_log_directories,
 )
 
 ALL_STATES = [
@@ -53,6 +60,93 @@ def make_change(change_id, verified):
         current_display="关闭", proposed_display="开启",
         verified=verified, warning="",
     )
+
+
+class LogDirectoryTests(unittest.TestCase):
+    def test_configured_and_protected_log_directories_are_both_exposed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config_path = root / "config" / "user.json"
+            config_path.parent.mkdir()
+            configured_logs = root / "custom-logs"
+            config_path.write_text(
+                json.dumps({"paths": {"logs_dir": str(configured_logs)}}),
+                encoding="utf-8",
+            )
+            program_data = root / "program-data"
+            protected_logs = program_data / "DailyGames" / "logs"
+            protected_logs.mkdir(parents=True)
+
+            directories = resolve_log_directories(
+                config_path,
+                program_data=program_data,
+            )
+
+            self.assertEqual(directories, (configured_logs, protected_logs))
+
+    def test_invalid_config_falls_back_to_project_logs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config_path = root / "config" / "user.json"
+            config_path.parent.mkdir()
+            config_path.write_text("{", encoding="utf-8")
+
+            directories = resolve_log_directories(
+                config_path,
+                program_data=root / "missing-program-data",
+            )
+
+            self.assertEqual(directories, (root / "logs",))
+
+
+class NativeUiTests(unittest.TestCase):
+    def test_native_ui_calls_declare_types_and_preserve_window_handle(self):
+        set_dpi = mock.Mock(return_value=0)
+        shcore = mock.Mock()
+        shcore.SetProcessDpiAwareness = set_dpi
+        get_parent = mock.Mock(return_value=0x1234567887654321)
+        user32 = mock.Mock()
+        user32.GetParent = get_parent
+        set_window_attribute = mock.Mock(return_value=0)
+        dwmapi = mock.Mock()
+        dwmapi.DwmSetWindowAttribute = set_window_attribute
+
+        def load_library(name, **_kwargs):
+            return {
+                "shcore": shcore,
+                "user32": user32,
+                "dwmapi": dwmapi,
+            }[name]
+
+        window = mock.Mock()
+        window.winfo_id.return_value = 0x1111222233334444
+        with mock.patch.object(ctypes, "WinDLL", side_effect=load_library):
+            _enable_dpi_awareness()
+            _enable_dark_title_bar(window)
+
+        self.assertEqual(set_dpi.argtypes, [ctypes.c_int])
+        self.assertIs(set_dpi.restype, ctypes.c_long)
+        self.assertEqual(set_dpi.call_args.args, (2,))
+        self.assertEqual(get_parent.argtypes, [ctypes.c_void_p])
+        self.assertIs(get_parent.restype, ctypes.c_void_p)
+        self.assertEqual(
+            get_parent.call_args.args[0].value,
+            0x1111222233334444,
+        )
+        self.assertEqual(
+            set_window_attribute.argtypes,
+            [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+            ],
+        )
+        self.assertIs(set_window_attribute.restype, ctypes.c_long)
+        self.assertEqual(
+            set_window_attribute.call_args.args[0].value,
+            0x1234567887654321,
+        )
 
 
 class FakeOrchestrator:

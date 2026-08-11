@@ -1,6 +1,8 @@
 ﻿param(
     [switch]$InstallElevated,
-    [switch]$RepairTasks
+    [switch]$RepairTasks,
+    [string]$ExpectedScriptSha256 = '',
+    [string]$ExpectedConfigSha256 = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -8,6 +10,25 @@ $LegacyTaskName = 'DailyGames-OneClick-Admin'
 $ProjectRoot = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $EntryPath = Join-Path $ProjectRoot 'daily_games.pyw'
 $ConfigPath = Join-Path $ProjectRoot 'config\user.json'
+$WindowsDirectory = [Environment]::GetFolderPath(
+    [Environment+SpecialFolder]::Windows
+)
+$WindowsPowerShellRoot = Join-Path `
+    $WindowsDirectory `
+    'System32\WindowsPowerShell\v1.0'
+$SystemPowerShellPath = Join-Path $WindowsPowerShellRoot 'powershell.exe'
+$BuiltInModuleRoot = Join-Path $WindowsPowerShellRoot 'Modules'
+$WorkerProductRoot = Join-Path (
+    [Environment]::GetFolderPath(
+        [Environment+SpecialFolder]::CommonApplicationData
+    )
+) 'DailyGames'
+$WorkerRoot = Join-Path $WorkerProductRoot 'workers'
+$WorkerLogRoot = Join-Path $WorkerProductRoot 'logs'
+$InstallerErrorLog = Join-Path $WorkerLogRoot 'installer_error.log'
+$AdministratorSid = 'S-1-5-32-544'
+$SystemSid = 'S-1-5-18'
+$UsersSid = 'S-1-5-32-545'
 
 function Show-LaunchError {
     param([string]$Message)
@@ -25,12 +46,362 @@ function Show-LaunchError {
     }
 }
 
+function Confirm-AdminTaskInstall {
+    $message = (
+        "首次安装或安全组件更新需要一次 Windows UAC 授权。`n`n" +
+        '点击“确定”后，请在下一个 Windows 提示中选择“是”。' +
+        "安装完成后，本次一键启动会自动继续；任务定义不变时，后续启动不再询问。"
+    )
+    try {
+        Add-Type -AssemblyName PresentationFramework
+        $result = [System.Windows.MessageBox]::Show(
+            $message,
+            '一键日常：需要管理员授权',
+            [System.Windows.MessageBoxButton]::OKCancel,
+            [System.Windows.MessageBoxImage]::Information
+        )
+        return $result -eq [System.Windows.MessageBoxResult]::OK
+    }
+    catch {
+        try {
+            Add-Type -AssemblyName System.Windows.Forms
+            $fallback = [System.Windows.Forms.MessageBox]::Show(
+                $message,
+                '一键日常：需要管理员授权',
+                [System.Windows.Forms.MessageBoxButtons]::OKCancel,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            )
+            return $fallback -eq [System.Windows.Forms.DialogResult]::OK
+        }
+        catch {
+            # 无法显示安装说明时失败关闭，不得直接跳到 Windows UAC。
+            return $false
+        }
+    }
+}
+
+function Show-InstallCancelled {
+    param([string]$Message)
+    try {
+        Add-Type -AssemblyName PresentationFramework
+        [System.Windows.MessageBox]::Show(
+            $Message,
+            '一键日常：首次安装未完成',
+            [System.Windows.MessageBoxButton]::OK,
+            [System.Windows.MessageBoxImage]::Warning
+        ) | Out-Null
+    }
+    catch {
+        # 消息框不可用时直接返回；没有获得授权时不得继续启动 GUI。
+    }
+}
+
+function Test-UacCancellation {
+    param([System.Exception]$Exception)
+
+    $current = $Exception
+    while ($null -ne $current) {
+        if (
+            ($current -is [System.ComponentModel.Win32Exception] -and
+                $current.NativeErrorCode -eq 1223) -or
+            $current.HResult -eq -2147023673
+        ) {
+            return $true
+        }
+        $current = $current.InnerException
+    }
+    return $false
+}
+
+function Write-InstallerFailure {
+    param([System.Exception]$Exception)
+
+    if (-not $InstallElevated -or $null -eq $Exception) {
+        return
+    }
+    try {
+        if (-not (Test-Path -LiteralPath $WorkerLogRoot -PathType Container)) {
+            return
+        }
+        $message = ([string]$Exception.Message) -replace '[\r\n]+', ' '
+        $record = "{0}`t{1}`t{2}{3}" -f @(
+            [DateTimeOffset]::Now.ToString('o'),
+            $Exception.GetType().FullName,
+            $message,
+            [Environment]::NewLine
+        )
+        [System.IO.File]::AppendAllText(
+            $InstallerErrorLog,
+            $record,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+    }
+    catch {
+        # 诊断日志失败不得覆盖原始安装错误。
+    }
+}
+
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
     return $principal.IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator
     )
+}
+
+function Get-FileSnapshot {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "找不到待核验文件：$Path"
+    }
+    [byte[]]$bytes = [System.IO.File]::ReadAllBytes($Path)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = [BitConverter]::ToString(
+            $sha256.ComputeHash($bytes)
+        ).Replace('-', '')
+    }
+    finally {
+        $sha256.Dispose()
+    }
+    return [pscustomobject]@{
+        Bytes = $bytes
+        Sha256 = $hash
+    }
+}
+
+function Initialize-TrustedPowerShellEnvironment {
+    if (-not (Test-Path -LiteralPath $SystemPowerShellPath -PathType Leaf)) {
+        throw "找不到 Windows 系统 PowerShell：$SystemPowerShellPath"
+    }
+    if (-not (Test-Path -LiteralPath $BuiltInModuleRoot -PathType Container)) {
+        throw "找不到 Windows PowerShell 内置模块目录：$BuiltInModuleRoot"
+    }
+
+    # 入口使用 -NoProfile，并把自动加载范围限制到 Windows 受保护目录，避免
+    # 用户级 PSModulePath 抢先提供同名 ScheduledTasks 或 Security 模块。
+    $env:PSModulePath = $BuiltInModuleRoot
+    foreach ($relativePath in @(
+        'Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1',
+        'ScheduledTasks\ScheduledTasks.psd1'
+    )) {
+        $modulePath = Join-Path $BuiltInModuleRoot $relativePath
+        if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
+            throw "找不到 Windows PowerShell 内置模块：$modulePath"
+        }
+        Import-Module -Name $modulePath -Force -ErrorAction Stop
+    }
+}
+
+function New-WorkerDirectorySecurity {
+    $security = [Security.AccessControl.DirectorySecurity]::new()
+    $security.SetAccessRuleProtection($true, $false)
+    $administrator = [Security.Principal.SecurityIdentifier]::new(
+        $AdministratorSid
+    )
+    $system = [Security.Principal.SecurityIdentifier]::new($SystemSid)
+    $users = [Security.Principal.SecurityIdentifier]::new($UsersSid)
+    $inheritance = (
+        [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+        [Security.AccessControl.InheritanceFlags]::ObjectInherit
+    )
+    $propagation = [Security.AccessControl.PropagationFlags]::None
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    $security.SetOwner($administrator)
+    [void]$security.AddAccessRule(
+        [Security.AccessControl.FileSystemAccessRule]::new(
+            $system,
+            [Security.AccessControl.FileSystemRights]::FullControl,
+            $inheritance,
+            $propagation,
+            $allow
+        )
+    )
+    [void]$security.AddAccessRule(
+        [Security.AccessControl.FileSystemAccessRule]::new(
+            $administrator,
+            [Security.AccessControl.FileSystemRights]::FullControl,
+            $inheritance,
+            $propagation,
+            $allow
+        )
+    )
+    [void]$security.AddAccessRule(
+        [Security.AccessControl.FileSystemAccessRule]::new(
+            $users,
+            [Security.AccessControl.FileSystemRights]::ReadAndExecute,
+            $inheritance,
+            $propagation,
+            $allow
+        )
+    )
+    return $security
+}
+
+function New-WorkerFileSecurity {
+    $security = [Security.AccessControl.FileSecurity]::new()
+    $security.SetAccessRuleProtection($true, $false)
+    $administrator = [Security.Principal.SecurityIdentifier]::new(
+        $AdministratorSid
+    )
+    $system = [Security.Principal.SecurityIdentifier]::new($SystemSid)
+    $users = [Security.Principal.SecurityIdentifier]::new($UsersSid)
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    $security.SetOwner($administrator)
+    foreach ($entry in @(
+        [pscustomobject]@{
+            Sid = $system
+            Rights = [Security.AccessControl.FileSystemRights]::FullControl
+        }
+        [pscustomobject]@{
+            Sid = $administrator
+            Rights = [Security.AccessControl.FileSystemRights]::FullControl
+        }
+        [pscustomobject]@{
+            Sid = $users
+            Rights = [Security.AccessControl.FileSystemRights]::ReadAndExecute
+        }
+    )) {
+        [void]$security.AddAccessRule(
+            [Security.AccessControl.FileSystemAccessRule]::new(
+                $entry.Sid,
+                $entry.Rights,
+                [Security.AccessControl.AccessControlType]::Allow
+            )
+        )
+    }
+    return $security
+}
+
+function Test-WorkerPathLocation {
+    param([string]$Path)
+
+    try {
+        $expectedRoot = [System.IO.Path]::GetFullPath($WorkerRoot)
+        $candidate = [System.IO.Path]::GetFullPath($Path)
+        return (
+            [System.IO.Path]::GetDirectoryName($candidate).Equals(
+                $expectedRoot,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -and
+            [System.IO.Path]::GetFileName($candidate) -match
+                '^launcher_automation_(Arknights|Endfield)\.ps1$'
+        )
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-ProtectedWorkerItemAcl {
+    param([string]$Path)
+
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if (
+            ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne
+            0
+        ) {
+            return $false
+        }
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        if (-not $acl.AreAccessRulesProtected) {
+            return $false
+        }
+        $ownerSid = $acl.GetOwner(
+            [Security.Principal.SecurityIdentifier]
+        ).Value
+        if ($ownerSid -notin @($AdministratorSid, $SystemSid)) {
+            return $false
+        }
+        $trustedWriters = @($AdministratorSid, $SystemSid)
+        # 不可用 Modify 這類複合值判斷：它同時包含讀取位元，會把合法的
+        # ReadAndExecute 規則誤判為可寫。只合併實際能改變內容或 ACL 的位元。
+        $dangerousRights = (
+            [Security.AccessControl.FileSystemRights]::WriteData -bor
+            [Security.AccessControl.FileSystemRights]::AppendData -bor
+            [Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
+            [Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+            [Security.AccessControl.FileSystemRights]::Delete -bor
+            [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+            [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+            [Security.AccessControl.FileSystemRights]::TakeOwnership
+        )
+        foreach ($rule in @($acl.Access)) {
+            if (
+                $rule.AccessControlType -ne
+                [Security.AccessControl.AccessControlType]::Allow
+            ) {
+                continue
+            }
+            $sid = $rule.IdentityReference.Translate(
+                [Security.Principal.SecurityIdentifier]
+            ).Value
+            if ($sid -in $trustedWriters) {
+                continue
+            }
+            if (
+                ([int64]$rule.FileSystemRights -band
+                    [int64]$dangerousRights) -ne 0
+            ) {
+                return $false
+            }
+        }
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-ProtectedWorkerPath {
+    param([string]$Path)
+
+    if (-not (Test-WorkerPathLocation -Path $Path)) {
+        return $false
+    }
+    foreach ($candidate in @(
+        $WorkerProductRoot,
+        $WorkerRoot,
+        $WorkerLogRoot,
+        $Path
+    )) {
+        if (-not (Test-ProtectedWorkerItemAcl -Path $candidate)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Initialize-ProtectedWorkerDirectory {
+    if (-not (Test-IsAdministrator)) {
+        throw '建立受保护启动器脚本目录时未获得管理员权限。'
+    }
+    foreach ($directory in @($WorkerProductRoot, $WorkerRoot, $WorkerLogRoot)) {
+        if (
+            (Test-Path -LiteralPath $directory) -and
+            -not (Test-Path -LiteralPath $directory -PathType Container)
+        ) {
+            throw "受保护启动器脚本路径不是目录：$directory"
+        }
+        [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+        $item = Get-Item -LiteralPath $directory -Force -ErrorAction Stop
+        if (
+            ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne
+            0
+        ) {
+            throw "受保护启动器脚本目录不得是重解析点：$directory"
+        }
+        Set-Acl `
+            -LiteralPath $directory `
+            -AclObject (New-WorkerDirectorySecurity)
+    }
+    foreach ($directory in @($WorkerProductRoot, $WorkerRoot, $WorkerLogRoot)) {
+        if (-not (Test-ProtectedWorkerItemAcl -Path $directory)) {
+            throw "受保护启动器脚本目录 ACL 校验失败：$directory"
+        }
+    }
 }
 
 function Get-PythonwPath {
@@ -80,6 +451,7 @@ function New-StartButtonActionSpec {
     param(
         [object]$Automation,
         [string]$GameProcessName,
+        [string]$GameExecutable,
         [string]$LauncherExecutable,
         [object[]]$LauncherArguments,
         [string]$WorkingDirectory,
@@ -108,6 +480,11 @@ function New-StartButtonActionSpec {
     $expectedGameButtonName = switch ($processName) {
         'Arknights' { '明日方舟' }
         'Endfield' { '明日方舟：终末地' }
+        default { throw "不支持的鹰角游戏进程：$GameProcessName" }
+    }
+    $unexpectedProcessName = switch ($processName) {
+        'Arknights' { 'Endfield' }
+        'Endfield' { 'Arknights' }
         default { throw "不支持的鹰角游戏进程：$GameProcessName" }
     }
     $gameButtonName = [string]$Automation.game_button_name
@@ -172,6 +549,61 @@ function New-StartButtonActionSpec {
     ) {
         throw '启动器窗口进程签名与已核验签名不一致。'
     }
+    $launcherItem = Get-Item `
+        -LiteralPath $resolvedLauncherExecutable `
+        -Force `
+        -ErrorAction Stop
+    $launcherDirectoryItem = Get-Item `
+        -LiteralPath ([System.IO.Path]::GetDirectoryName(
+            $resolvedLauncherExecutable
+        )) `
+        -Force `
+        -ErrorAction Stop
+    if (
+        ($launcherItem.Attributes -band
+            [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        ($launcherDirectoryItem.Attributes -band
+            [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $launcherItem.VersionInfo.FileVersion -ne $expectedWindowVersion
+    ) {
+        throw '启动器主程序路径或版本与已核验身份不一致。'
+    }
+    $launcherSignature = Get-AuthenticodeSignature `
+        -LiteralPath $resolvedLauncherExecutable
+    if (
+        $launcherSignature.Status -ne 'Valid' -or
+        $null -eq $launcherSignature.SignerCertificate -or
+        $launcherSignature.SignerCertificate.Thumbprint.ToUpperInvariant() -ne
+        $expectedSignerThumbprint
+    ) {
+        throw '启动器主程序签名与已核验签名不一致。'
+    }
+    $resolvedGameExecutable = [System.IO.Path]::GetFullPath($GameExecutable)
+    $gameItem = Get-Item `
+        -LiteralPath $resolvedGameExecutable `
+        -Force `
+        -ErrorAction Stop
+    if (
+        $gameItem.PSIsContainer -or
+        ($gameItem.Attributes -band
+            [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        -not [System.IO.Path]::GetFileName($resolvedGameExecutable).Equals(
+            $GameProcessName,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    ) {
+        throw '目标游戏程序路径与进程名不一致。'
+    }
+    $gameSignature = Get-AuthenticodeSignature `
+        -LiteralPath $resolvedGameExecutable
+    if (
+        $gameSignature.Status -ne 'Valid' -or
+        $null -eq $gameSignature.SignerCertificate -or
+        $gameSignature.SignerCertificate.Thumbprint.ToUpperInvariant() -ne
+        $expectedSignerThumbprint
+    ) {
+        throw '目标游戏程序签名与已核验签名不一致。'
+    }
     $initialDelay = [int]$Automation.initial_delay_s
     $selectionDelay = [int]$Automation.selection_delay_s
     $timeout = [int]$Automation.timeout_s
@@ -201,19 +633,24 @@ function New-StartButtonActionSpec {
         throw '启动器按钮纵向相对位置超出安全范围。'
     }
     $resolvedDebugLog = [System.IO.Path]::GetFullPath($DebugLogPath)
-    if (-not $resolvedDebugLog.StartsWith(
-        $ProjectRoot + [System.IO.Path]::DirectorySeparatorChar,
-        [System.StringComparison]::OrdinalIgnoreCase
-    )) {
-        throw '启动器按钮自动化日志必须位于项目根目录内。'
+    if (
+        -not [System.IO.Path]::GetDirectoryName($resolvedDebugLog).Equals(
+            [System.IO.Path]::GetFullPath($WorkerLogRoot),
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -or
+        [System.IO.Path]::GetFileName($resolvedDebugLog) -ne
+            'launcher_button_automation.log'
+    ) {
+        throw '启动器按钮自动化日志必须位于受保护的 ProgramData logs 目录。'
     }
 
     $metadata = [ordered]@{
-        version = 3
+        version = 4
         launcher_executable = $resolvedLauncherExecutable
         working_directory = $WorkingDirectory
         arguments = ConvertTo-TaskArguments $launcherArgumentValues
         target_process = $GameProcessName
+        target_executable = $resolvedGameExecutable
     }
     $metadataJson = $metadata | ConvertTo-Json -Compress
     $metadataEncoded = [Convert]::ToBase64String(
@@ -221,7 +658,7 @@ function New-StartButtonActionSpec {
     )
 
     $source = @'
-# DAILY_GAMES_LAUNCHER_WORKER_V3=__WRAPPER_METADATA__
+# DAILY_GAMES_LAUNCHER_WORKER_V4=__WRAPPER_METADATA__
 param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[A-Fa-f0-9]{64}$')]
@@ -309,6 +746,10 @@ namespace DailyGames {
         [DllImport("user32.dll")]
         private static extern uint SendInput(uint count, Input[] inputs, int size);
         [DllImport("user32.dll")]
+        private static extern IntPtr WindowFromPoint(LauncherPoint point);
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetAncestor(IntPtr window, uint flags);
+        [DllImport("user32.dll")]
         private static extern bool SetProcessDPIAware();
 
         public static bool ActivateVerifiedWindow(IntPtr window) {
@@ -365,18 +806,44 @@ namespace DailyGames {
             int x = rect.Left + (int)Math.Round(width * xRatio);
             int y = rect.Top + (int)Math.Round(height * yRatio);
             LauncherPoint oldPoint;
-            GetCursorPos(out oldPoint);
+            if (!GetCursorPos(out oldPoint)) return false;
             if (!SetCursorPos(x, y)) return false;
+            try {
+                Thread.Sleep(25);
+                LauncherRect currentRect;
+                if (
+                    GetForegroundWindow() != window ||
+                    !GetWindowRect(window, out currentRect) ||
+                    currentRect.Left != rect.Left ||
+                    currentRect.Top != rect.Top ||
+                    currentRect.Right != rect.Right ||
+                    currentRect.Bottom != rect.Bottom
+                ) return false;
 
-            Input[] inputs = new Input[2];
-            inputs[0].Type = 0;
-            inputs[0].Mouse.Flags = 0x0002;
-            inputs[1].Type = 0;
-            inputs[1].Mouse.Flags = 0x0004;
-            uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input)));
-            Thread.Sleep(80);
-            SetCursorPos(oldPoint.X, oldPoint.Y);
-            return sent == inputs.Length;
+                LauncherPoint clickPoint = new LauncherPoint { X = x, Y = y };
+                IntPtr hitWindow = WindowFromPoint(clickPoint);
+                if (
+                    hitWindow == IntPtr.Zero ||
+                    GetAncestor(hitWindow, 2) != window ||
+                    GetForegroundWindow() != window
+                ) return false;
+
+                Input[] inputs = new Input[2];
+                inputs[0].Type = 0;
+                inputs[0].Mouse.Flags = 0x0002;
+                inputs[1].Type = 0;
+                inputs[1].Mouse.Flags = 0x0004;
+                uint sent = SendInput(
+                    (uint)inputs.Length,
+                    inputs,
+                    Marshal.SizeOf(typeof(Input))
+                );
+                Thread.Sleep(80);
+                return sent == inputs.Length;
+            }
+            finally {
+                SetCursorPos(oldPoint.X, oldPoint.Y);
+            }
         }
     }
 }
@@ -439,6 +906,56 @@ function Invoke-AccessibleButton {
     }
     catch {
         return $false
+    }
+}
+
+function Get-AccessibleSelectionState {
+    param(
+        [IntPtr]$Window,
+        [string]$Name
+    )
+    try {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($Window)
+        $condition = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::NameProperty,
+            $Name
+        )
+        $button = $root.FindFirst(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            $condition
+        )
+        if ($null -eq $button) {
+            return 'unknown'
+        }
+        $pattern = $null
+        if ($button.TryGetCurrentPattern(
+            [System.Windows.Automation.SelectionItemPattern]::Pattern,
+            [ref]$pattern
+        )) {
+            if ((
+                [System.Windows.Automation.SelectionItemPattern]$pattern
+            ).Current.IsSelected) {
+                return 'selected'
+            }
+            return 'not_selected'
+        }
+        if ($button.TryGetCurrentPattern(
+            [System.Windows.Automation.TogglePattern]::Pattern,
+            [ref]$pattern
+        )) {
+            if ((
+                [System.Windows.Automation.TogglePattern]$pattern
+            ).Current.ToggleState -eq
+                [System.Windows.Automation.ToggleState]::On
+            ) {
+                return 'selected'
+            }
+            return 'not_selected'
+        }
+        return 'unknown'
+    }
+    catch {
+        return 'unknown'
     }
 }
 
@@ -523,6 +1040,91 @@ function Test-VerifiedLauncherWindow {
     }
 }
 
+function Test-LauncherExecutableIdentity {
+    try {
+        $launcherPath = [System.IO.Path]::GetFullPath(
+            '__LAUNCHER_EXECUTABLE__'
+        )
+        $launcher = Get-Item `
+            -LiteralPath $launcherPath `
+            -Force `
+            -ErrorAction Stop
+        $launcherDirectory = Get-Item `
+            -LiteralPath ([System.IO.Path]::GetDirectoryName($launcherPath)) `
+            -Force `
+            -ErrorAction Stop
+        if (
+            $launcher.PSIsContainer -or
+            ($launcher.Attributes -band
+                [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            ($launcherDirectory.Attributes -band
+                [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            $launcher.VersionInfo.FileVersion -ne '__WINDOW_VERSION__'
+        ) {
+            return $false
+        }
+        $signature = Get-AuthenticodeSignature -LiteralPath $launcherPath
+        return (
+            $signature.Status -eq 'Valid' -and
+            $null -ne $signature.SignerCertificate -and
+            $signature.SignerCertificate.Thumbprint.ToUpperInvariant() -eq
+                '__WINDOW_SIGNER_THUMBPRINT__'
+        )
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-VerifiedTargetGameProcess {
+    $currentSessionId = (
+        [System.Diagnostics.Process]::GetCurrentProcess()
+    ).SessionId
+    foreach ($candidate in @(
+        Get-Process -Name '__PROCESS_NAME__' -ErrorAction SilentlyContinue
+    )) {
+        try {
+            if ($candidate.SessionId -ne $currentSessionId) {
+                continue
+            }
+            $candidatePath = [System.IO.Path]::GetFullPath(
+                $candidate.MainModule.FileName
+            )
+            if (-not $candidatePath.Equals(
+                '__TARGET_EXECUTABLE__',
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+                continue
+            }
+            $candidateItem = Get-Item `
+                -LiteralPath $candidatePath `
+                -Force `
+                -ErrorAction Stop
+            if (
+                $candidateItem.PSIsContainer -or
+                ($candidateItem.Attributes -band
+                    [System.IO.FileAttributes]::ReparsePoint) -ne 0
+            ) {
+                continue
+            }
+            $signature = Get-AuthenticodeSignature `
+                -LiteralPath $candidatePath
+            if (
+                $signature.Status -eq 'Valid' -and
+                $null -ne $signature.SignerCertificate -and
+                $signature.SignerCertificate.Thumbprint.ToUpperInvariant() -eq
+                    '__WINDOW_SIGNER_THUMBPRINT__'
+            ) {
+                return $true
+            }
+        }
+        catch {
+            continue
+        }
+    }
+    return $false
+}
+
 $script:lastAutomationStatus = ''
 $script:windowVerificationStatus = 'verified_window_not_checked'
 if (-not $nativeTypesReady) {
@@ -530,6 +1132,14 @@ if (-not $nativeTypesReady) {
     exit 7
 }
 Write-AutomationStatus -Code 'started'
+if (-not (Test-LauncherExecutableIdentity)) {
+    Write-AutomationStatus -Code 'launcher_identity_mismatch'
+    exit 9
+}
+if (Get-Process -Name '__UNEXPECTED_PROCESS_NAME__' -ErrorAction SilentlyContinue) {
+    Write-AutomationStatus -Code 'unexpected_game_already_running'
+    exit 8
+}
 try {
     Start-Process `
         -FilePath '__LAUNCHER_EXECUTABLE__' `
@@ -545,7 +1155,7 @@ catch {
 Start-Sleep -Seconds __INITIAL_DELAY__
 $deadline = (Get-Date).AddSeconds(__TIMEOUT__)
 do {
-    if (Get-Process -Name '__PROCESS_NAME__' -ErrorAction SilentlyContinue) {
+    if (Test-VerifiedTargetGameProcess) {
         Write-AutomationStatus -Code 'target_already_running'
         exit 0
     }
@@ -580,7 +1190,7 @@ do {
             __SELECTOR_Y_RATIO__
         )
         if ($selected) {
-            Write-AutomationStatus -Code 'game_selected_by_verified_position'
+            Write-AutomationStatus -Code 'game_selection_clicked_by_verified_position'
         }
     }
     if (-not $selected) {
@@ -595,6 +1205,19 @@ do {
     ) {
         Write-AutomationStatus -Code 'window_changed_before_start'
         exit 4
+    }
+    $selectionState = Get-AccessibleSelectionState `
+        -Window $window `
+        -Name '__GAME_BUTTON_NAME__'
+    if ($selectionState -eq 'not_selected') {
+        Write-AutomationStatus -Code 'game_selection_not_confirmed'
+        exit 3
+    }
+    if ($selectionState -eq 'selected') {
+        Write-AutomationStatus -Code 'game_selection_confirmed_by_accessibility'
+    }
+    else {
+        Write-AutomationStatus -Code 'game_selection_not_observable'
     }
 
     $invoked = Invoke-AccessibleButton -Window $window -Name '开始游戏'
@@ -618,7 +1241,15 @@ do {
 
     do {
         Start-Sleep -Milliseconds 250
-        if (Get-Process -Name '__PROCESS_NAME__' -ErrorAction SilentlyContinue) {
+        if (
+            Get-Process `
+                -Name '__UNEXPECTED_PROCESS_NAME__' `
+                -ErrorAction SilentlyContinue
+        ) {
+            Write-AutomationStatus -Code 'unexpected_game_started'
+            exit 8
+        }
+        if (Test-VerifiedTargetGameProcess) {
             Write-AutomationStatus -Code 'target_started'
             exit 0
         }
@@ -632,6 +1263,14 @@ exit 2
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
     $source = $source.Replace('__WRAPPER_METADATA__', $metadataEncoded)
     $source = $source.Replace('__PROCESS_NAME__', $processName)
+    $source = $source.Replace(
+        '__UNEXPECTED_PROCESS_NAME__',
+        $unexpectedProcessName
+    )
+    $source = $source.Replace(
+        '__TARGET_EXECUTABLE__',
+        $resolvedGameExecutable.Replace("'", "''")
+    )
     $source = $source.Replace(
         '__LAUNCHER_EXECUTABLE__',
         $resolvedLauncherExecutable.Replace("'", "''")
@@ -700,7 +1339,7 @@ exit 2
             [string]$workerErrors[0].Message
         )
     }
-    $workerDirectory = Join-Path $ProjectRoot '.generated'
+    $workerDirectory = $WorkerRoot
     $workerPath = Join-Path (
         $workerDirectory
     ) ("launcher_automation_$processName.ps1")
@@ -722,7 +1361,7 @@ exit 2
         $sha256.Dispose()
     }
     return [pscustomobject]@{
-        Executable = Join-Path $PSHOME 'powershell.exe'
+        Executable = $SystemPowerShellPath
         WorkingDirectory = $WorkingDirectory
         Arguments = ConvertTo-TaskArguments @(
             '-NoProfile',
@@ -744,7 +1383,8 @@ function New-AdminTaskSpec {
         [string]$Executable,
         [object[]]$Arguments,
         [object]$StartButtonAutomation = $null,
-        [string]$GameProcessName = ''
+        [string]$GameProcessName = '',
+        [string]$GameExecutable = ''
     )
     $fullPath = [System.IO.Path]::GetFullPath($Executable)
     if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
@@ -754,10 +1394,11 @@ function New-AdminTaskSpec {
     $wrapperAction = New-StartButtonActionSpec `
         -Automation $StartButtonAutomation `
         -GameProcessName $GameProcessName `
+        -GameExecutable $GameExecutable `
         -LauncherExecutable $fullPath `
         -LauncherArguments $Arguments `
         -WorkingDirectory $workingDirectory `
-        -DebugLogPath (Join-Path $ProjectRoot 'logs\launcher_button_automation.log')
+        -DebugLogPath (Join-Path $WorkerLogRoot 'launcher_button_automation.log')
     if ($null -eq $wrapperAction) {
         $taskExecutable = $fullPath
         $taskWorkingDirectory = $workingDirectory
@@ -789,18 +1430,24 @@ function New-AdminTaskSpec {
 }
 
 function Get-AdminTaskSpecs {
-    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
-        throw "找不到配置文件：$ConfigPath"
+    param([byte[]]$ConfigBytes)
+
+    if ($null -eq $ConfigBytes -or $ConfigBytes.Length -eq 0) {
+        throw '管理员任务配置快照为空。'
     }
-    $config = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 |
-        ConvertFrom-Json
+    $configText = [System.Text.Encoding]::UTF8.GetString($ConfigBytes)
+    if ($configText.Length -gt 0 -and $configText[0] -eq [char]0xFEFF) {
+        $configText = $configText.Substring(1)
+    }
+    $config = $configText | ConvertFrom-Json
     return @(
         New-AdminTaskSpec `
             -Name 'DailyGames-Arknights-Admin' `
             -Executable ([string]$config.games.arknights.launcher.executable) `
             -Arguments @($config.games.arknights.launcher.args) `
             -StartButtonAutomation $config.games.arknights.launcher.start_button_automation `
-            -GameProcessName ([string]$config.games.arknights.game_process_name)
+            -GameProcessName ([string]$config.games.arknights.game_process_name) `
+            -GameExecutable ([string]$config.games.arknights.game_executable)
         New-AdminTaskSpec `
             -Name 'DailyGames-MAA-Admin' `
             -Executable ([string]$config.games.arknights.helper.executable) `
@@ -810,7 +1457,8 @@ function Get-AdminTaskSpecs {
             -Executable ([string]$config.games.endfield.launcher.executable) `
             -Arguments @($config.games.endfield.launcher.args) `
             -StartButtonAutomation $config.games.endfield.launcher.start_button_automation `
-            -GameProcessName ([string]$config.games.endfield.game_process_name)
+            -GameProcessName ([string]$config.games.endfield.game_process_name) `
+            -GameExecutable ([string]$config.games.endfield.game_executable)
         New-AdminTaskSpec `
             -Name 'DailyGames-MaaEnd-Admin' `
             -Executable ([string]$config.games.endfield.helper.executable) `
@@ -856,17 +1504,8 @@ function Test-WorkerFileMatchesSpec {
         return $true
     }
     try {
-        $workerRoot = [System.IO.Path]::GetFullPath(
-            (Join-Path $ProjectRoot '.generated')
-        )
         $workerPath = [System.IO.Path]::GetFullPath([string]$Spec.WorkerPath)
-        if (-not $workerPath.StartsWith(
-            $workerRoot + [System.IO.Path]::DirectorySeparatorChar,
-            [System.StringComparison]::OrdinalIgnoreCase
-        )) {
-            return $false
-        }
-        if (-not (Test-Path -LiteralPath $workerPath -PathType Leaf)) {
+        if (-not (Test-ProtectedWorkerPath -Path $workerPath)) {
             return $false
         }
         $actualHash = (
@@ -888,17 +1527,11 @@ function Write-LauncherWorker {
     if ([string]::IsNullOrWhiteSpace([string]$Spec.WorkerPath)) {
         return
     }
-    $workerRoot = [System.IO.Path]::GetFullPath(
-        (Join-Path $ProjectRoot '.generated')
-    )
     $workerPath = [System.IO.Path]::GetFullPath([string]$Spec.WorkerPath)
-    if (-not $workerPath.StartsWith(
-        $workerRoot + [System.IO.Path]::DirectorySeparatorChar,
-        [System.StringComparison]::OrdinalIgnoreCase
-    )) {
-        throw '启动器包装脚本必须位于项目根目录的 .generated 子目录。'
+    if (-not (Test-WorkerPathLocation -Path $workerPath)) {
+        throw '启动器包装脚本必须位于受保护的 ProgramData workers 目录。'
     }
-    [System.IO.Directory]::CreateDirectory($workerRoot) | Out-Null
+    Initialize-ProtectedWorkerDirectory
     $temporaryPath = "$workerPath.$([Guid]::NewGuid().ToString('N')).tmp"
     $utf8WithBom = [System.Text.UTF8Encoding]::new($true)
     try {
@@ -920,6 +1553,9 @@ function Write-LauncherWorker {
             -LiteralPath $temporaryPath `
             -Destination $workerPath `
             -Force
+        Set-Acl `
+            -LiteralPath $workerPath `
+            -AclObject (New-WorkerFileSecurity)
     }
     finally {
         if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
@@ -931,7 +1567,60 @@ function Write-LauncherWorker {
     }
 }
 
+function Test-TaskSecurityContract {
+    param([object]$Task)
+
+    try {
+        $triggerCount = @(
+            $Task.Triggers | Where-Object { $null -ne $_ }
+        ).Count
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principalUser = [string]$Task.Principal.UserId
+        if ($principalUser -match '^S-\d+(?:-\d+)+$') {
+            $principalSid = [Security.Principal.SecurityIdentifier]::new(
+                $principalUser
+            )
+        }
+        else {
+            $principalSid = [Security.Principal.NTAccount]::new(
+                $principalUser
+            ).Translate([Security.Principal.SecurityIdentifier])
+        }
+        $userMatches = $principalSid.Value.Equals(
+            $identity.User.Value,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+        return (
+            $userMatches -and
+            ([string]$Task.Principal.LogonType) -eq 'Interactive' -and
+            ([string]$Task.Principal.RunLevel) -eq 'Highest' -and
+            [bool]$Task.Settings.Enabled -and
+            [bool]$Task.Settings.AllowDemandStart -and
+            ([string]$Task.Settings.MultipleInstances) -eq 'IgnoreNew' -and
+            ([string]$Task.Settings.ExecutionTimeLimit) -eq 'PT12H' -and
+            -not [bool]$Task.Settings.DisallowStartIfOnBatteries -and
+            -not [bool]$Task.Settings.StopIfGoingOnBatteries -and
+            $triggerCount -eq 0
+        )
+    }
+    catch {
+        return $false
+    }
+}
+
 function Test-TaskMatchesProject {
+    param(
+        [object]$Task,
+        [object]$Spec
+    )
+
+    return (
+        (Test-TaskDefinitionMatchesSpec -Task $Task -Spec $Spec) -and
+        (Test-WorkerFileMatchesSpec -Spec $Spec)
+    )
+}
+
+function Test-TaskDefinitionMatchesSpec {
     param(
         [object]$Task,
         [object]$Spec
@@ -944,19 +1633,241 @@ function Test-TaskMatchesProject {
     if (-not (Test-TaskActionMatches -Action $actions[0] -Spec $Spec)) {
         return $false
     }
-    return (
-        ([string]$Task.Principal.RunLevel) -eq 'Highest' -and
-        (Test-WorkerFileMatchesSpec -Spec $Spec)
+    return (Test-TaskSecurityContract -Task $Task)
+}
+
+function New-AdminInstallState {
+    param(
+        [object]$Spec,
+        [object]$ExistingTask
     )
+
+    $taskExisted = $null -ne $ExistingTask
+    $taskXml = ''
+    if ($taskExisted) {
+        $taskXml = [string](Export-ScheduledTask `
+            -InputObject $ExistingTask `
+            -ErrorAction Stop)
+        if ([string]::IsNullOrWhiteSpace($taskXml)) {
+            throw "无法导出计划任务以供回滚：$($Spec.TaskName)"
+        }
+    }
+
+    $workerPath = [string]$Spec.WorkerPath
+    $workerExisted = $false
+    [byte[]]$workerBytes = @()
+    $workerHash = ''
+    $workerAcl = $null
+    if (-not [string]::IsNullOrWhiteSpace($workerPath)) {
+        $workerPath = [System.IO.Path]::GetFullPath($workerPath)
+        if (-not (Test-WorkerPathLocation -Path $workerPath)) {
+            throw '启动器包装脚本快照路径超出受保护 workers 目录。'
+        }
+        $workerItem = Get-Item `
+            -LiteralPath $workerPath `
+            -Force `
+            -ErrorAction SilentlyContinue
+        if ($null -ne $workerItem) {
+            if (
+                [bool]$workerItem.PSIsContainer -or
+                ($workerItem.Attributes -band
+                    [System.IO.FileAttributes]::ReparsePoint) -ne 0
+            ) {
+                throw "启动器包装脚本快照目标不是普通文件：$workerPath"
+            }
+            $workerSnapshot = Get-FileSnapshot -Path $workerPath
+            $workerExisted = $true
+            $workerBytes = [byte[]]$workerSnapshot.Bytes
+            $workerHash = [string]$workerSnapshot.Sha256
+            $workerAcl = Get-Acl -LiteralPath $workerPath -ErrorAction Stop
+        }
+    }
+
+    return [pscustomobject]@{
+        Spec = $Spec
+        TaskExisted = $taskExisted
+        TaskXml = $taskXml
+        TaskTouched = $false
+        WorkerPath = $workerPath
+        WorkerExisted = $workerExisted
+        WorkerBytes = $workerBytes
+        WorkerHash = $workerHash
+        WorkerAcl = $workerAcl
+        WorkerTouched = $false
+    }
+}
+
+function Restore-LauncherWorkerState {
+    param([object]$State)
+
+    if (
+        -not [bool]$State.WorkerTouched -or
+        [string]::IsNullOrWhiteSpace([string]$State.WorkerPath)
+    ) {
+        return
+    }
+    $workerPath = [System.IO.Path]::GetFullPath([string]$State.WorkerPath)
+    if (-not (Test-WorkerPathLocation -Path $workerPath)) {
+        throw '拒绝回滚 workers 目录以外的包装脚本。'
+    }
+    $currentItem = Get-Item `
+        -LiteralPath $workerPath `
+        -Force `
+        -ErrorAction SilentlyContinue
+    if (
+        $null -ne $currentItem -and
+        (
+            [bool]$currentItem.PSIsContainer -or
+            ($currentItem.Attributes -band
+                [System.IO.FileAttributes]::ReparsePoint) -ne 0
+        )
+    ) {
+        throw "包装脚本在安装期间变成非普通文件，拒绝覆盖：$workerPath"
+    }
+
+    if ([bool]$State.WorkerExisted) {
+        if ($null -ne $currentItem) {
+            $currentHash = [string](
+                Get-FileSnapshot -Path $workerPath
+            ).Sha256
+            $matchesOld = $currentHash.Equals(
+                [string]$State.WorkerHash,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+            $matchesInstalled = $currentHash.Equals(
+                [string]$State.Spec.WorkerSha256,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+            if (-not $matchesOld -and -not $matchesInstalled) {
+                throw "包装脚本在安装期间被外部修改，拒绝覆盖：$workerPath"
+            }
+        }
+        $temporaryPath = "$workerPath.$([Guid]::NewGuid().ToString('N')).rollback"
+        try {
+            [System.IO.File]::WriteAllBytes(
+                $temporaryPath,
+                [byte[]]$State.WorkerBytes
+            )
+            $temporaryHash = [string](
+                Get-FileSnapshot -Path $temporaryPath
+            ).Sha256
+            if (-not $temporaryHash.Equals(
+                [string]$State.WorkerHash,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+                throw '包装脚本回滚暂存文件哈希校验失败。'
+            }
+            Move-Item `
+                -LiteralPath $temporaryPath `
+                -Destination $workerPath `
+                -Force
+            Set-Acl `
+                -LiteralPath $workerPath `
+                -AclObject $State.WorkerAcl
+        }
+        finally {
+            if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+                Remove-Item -LiteralPath $temporaryPath -Force
+            }
+        }
+        $restoredHash = [string](
+            Get-FileSnapshot -Path $workerPath
+        ).Sha256
+        if (-not $restoredHash.Equals(
+            [string]$State.WorkerHash,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw '包装脚本回滚后的哈希校验失败。'
+        }
+        return
+    }
+
+    if ($null -eq $currentItem) {
+        return
+    }
+    $currentHash = [string](Get-FileSnapshot -Path $workerPath).Sha256
+    if (-not $currentHash.Equals(
+        [string]$State.Spec.WorkerSha256,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "本轮新建包装脚本被外部修改，拒绝删除：$workerPath"
+    }
+    Remove-Item -LiteralPath $workerPath -Force -ErrorAction Stop
+}
+
+function Restore-AdminInstallStates {
+    param([object[]]$States)
+
+    $rollbackErrors = [Collections.Generic.List[string]]::new()
+    for ($index = $States.Count - 1; $index -ge 0; $index--) {
+        $state = $States[$index]
+        if ([bool]$state.TaskTouched) {
+            try {
+                if ([bool]$state.TaskExisted) {
+                    Register-ScheduledTask `
+                        -TaskName $state.Spec.TaskName `
+                        -Xml ([string]$state.TaskXml) `
+                        -Force `
+                        -ErrorAction Stop | Out-Null
+                }
+                else {
+                    $currentTask = Get-ScheduledTask `
+                        -TaskName $state.Spec.TaskName `
+                        -ErrorAction SilentlyContinue
+                    if ($null -ne $currentTask) {
+                        if (-not (Test-TaskDefinitionMatchesSpec `
+                            -Task $currentTask `
+                            -Spec $state.Spec)) {
+                            throw '本轮新建任务已被外部修改，拒绝删除。'
+                        }
+                        Unregister-ScheduledTask `
+                            -TaskName $state.Spec.TaskName `
+                            -Confirm:$false `
+                            -ErrorAction Stop
+                    }
+                }
+            }
+            catch {
+                $rollbackErrors.Add(
+                    "任务 $($state.Spec.TaskName) 回滚失败：$($_.Exception.Message)"
+                )
+            }
+        }
+        try {
+            Restore-LauncherWorkerState -State $state
+        }
+        catch {
+            $rollbackErrors.Add(
+                "任务 $($state.Spec.TaskName) 的包装脚本回滚失败：" +
+                $_.Exception.Message
+            )
+        }
+    }
+    return @($rollbackErrors)
 }
 
 function Install-AdminTask {
+    param([string]$ExpectedConfigHash)
+
     if (-not (Test-IsAdministrator)) {
         throw '安装管理员启动任务时未获得管理员权限。'
     }
     if (-not (Test-Path -LiteralPath $EntryPath -PathType Leaf)) {
         throw "找不到程序入口：$EntryPath"
     }
+    if ($ExpectedConfigHash -notmatch '^[0-9A-Fa-f]{64}$') {
+        throw '管理员安装缺少有效的配置快照 SHA-256。'
+    }
+    $configSnapshot = Get-FileSnapshot -Path $ConfigPath
+    if (-not $configSnapshot.Sha256.Equals(
+        $ExpectedConfigHash,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw '配置在请求 UAC 前后发生变化，已中止管理员任务安装。'
+    }
+    $installSpecs = @(
+        Get-AdminTaskSpecs -ConfigBytes ([byte[]]$configSnapshot.Bytes)
+    )
 
     $principal = New-ScheduledTaskPrincipal `
         -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
@@ -967,7 +1878,8 @@ function Install-AdminTask {
         -DontStopIfGoingOnBatteries `
         -ExecutionTimeLimit (New-TimeSpan -Hours 12) `
         -MultipleInstances IgnoreNew
-    foreach ($spec in @(Get-AdminTaskSpecs)) {
+    $installStates = @()
+    foreach ($spec in $installSpecs) {
         $existing = Get-ScheduledTask `
             -TaskName $spec.TaskName `
             -ErrorAction SilentlyContinue
@@ -977,24 +1889,76 @@ function Install-AdminTask {
         ) {
             continue
         }
-        Write-LauncherWorker -Spec $spec
-        $actionParameters = @{
-            Execute = $spec.Executable
-            WorkingDirectory = $spec.WorkingDirectory
-        }
-        if (-not [string]::IsNullOrWhiteSpace($spec.Arguments)) {
-            $actionParameters.Argument = $spec.Arguments
-        }
-        $actions = @(New-ScheduledTaskAction @actionParameters)
-        $definition = New-ScheduledTask `
-            -Action $actions `
-            -Principal $principal `
-            -Settings $settings
+        $installStates += New-AdminInstallState `
+            -Spec $spec `
+            -ExistingTask $existing
+    }
 
-        Register-ScheduledTask `
-            -TaskName $spec.TaskName `
-            -InputObject $definition `
-            -Force | Out-Null
+    try {
+        Initialize-ProtectedWorkerDirectory
+        foreach ($state in $installStates) {
+            $spec = $state.Spec
+            if (-not [string]::IsNullOrWhiteSpace([string]$spec.WorkerPath)) {
+                $state.WorkerTouched = $true
+            }
+            Write-LauncherWorker -Spec $spec
+            $actionParameters = @{
+                Execute = $spec.Executable
+                WorkingDirectory = $spec.WorkingDirectory
+            }
+            if (-not [string]::IsNullOrWhiteSpace($spec.Arguments)) {
+                $actionParameters.Argument = $spec.Arguments
+            }
+            $actions = @(New-ScheduledTaskAction @actionParameters)
+            $definition = New-ScheduledTask `
+                -Action $actions `
+                -Principal $principal `
+                -Settings $settings
+
+            # Register-ScheduledTask 可能已完成替换后才抛错，因此调用前标记。
+            $state.TaskTouched = $true
+            Register-ScheduledTask `
+                -TaskName $spec.TaskName `
+                -InputObject $definition `
+                -Force `
+                -ErrorAction Stop | Out-Null
+            $installedTask = Get-ScheduledTask `
+                -TaskName $spec.TaskName `
+                -ErrorAction Stop
+            if (-not (Test-TaskMatchesProject `
+                -Task $installedTask `
+                -Spec $spec)) {
+                throw "管理员任务安装后校验失败：$($spec.TaskName)"
+            }
+        }
+        foreach ($spec in $installSpecs) {
+            $installedTask = Get-ScheduledTask `
+                -TaskName $spec.TaskName `
+                -ErrorAction Stop
+            if (-not (Test-TaskMatchesProject `
+                -Task $installedTask `
+                -Spec $spec)) {
+                throw "管理员任务整批校验失败：$($spec.TaskName)"
+            }
+        }
+    }
+    catch {
+        $installFailure = $_.Exception
+        $rollbackErrors = @(Restore-AdminInstallStates -States $installStates)
+        if ($rollbackErrors.Count -gt 0) {
+            throw [InvalidOperationException]::new(
+                (
+                    "管理员任务安装失败，且回滚未完整完成：" +
+                    ($rollbackErrors -join '；')
+                ),
+                $installFailure
+            )
+        }
+        throw [InvalidOperationException]::new(
+            "管理员任务安装失败，已回滚本轮任务与包装脚本：" +
+            $installFailure.Message,
+            $installFailure
+        )
     }
 
     # 旧版本曾把整个编排器提权，导致鹰角启动器无法正常拉起游戏。
@@ -1011,8 +1975,19 @@ function Install-AdminTask {
 }
 
 try {
+    $scriptSnapshot = Get-FileSnapshot -Path $PSCommandPath
+    Initialize-TrustedPowerShellEnvironment
     if ($InstallElevated) {
-        Install-AdminTask
+        if (
+            $ExpectedScriptSha256 -notmatch '^[0-9A-Fa-f]{64}$' -or
+            -not $scriptSnapshot.Sha256.Equals(
+                $ExpectedScriptSha256,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        ) {
+            throw '启动脚本在请求 UAC 前后发生变化，已中止管理员任务安装。'
+        }
+        Install-AdminTask -ExpectedConfigHash $ExpectedConfigSha256
         exit 0
     }
 
@@ -1021,7 +1996,10 @@ try {
     }
     $pythonwPath = Get-PythonwPath
     Invoke-SoftwarePathSelfCheck -PythonwPath $pythonwPath
-    $specs = @(Get-AdminTaskSpecs)
+    $configSnapshot = Get-FileSnapshot -Path $ConfigPath
+    $specs = @(
+        Get-AdminTaskSpecs -ConfigBytes ([byte[]]$configSnapshot.Bytes)
+    )
     $tasksReady = $true
     foreach ($spec in $specs) {
         $task = Get-ScheduledTask `
@@ -1034,20 +2012,42 @@ try {
     }
     if (-not $tasksReady) {
         # 第一次安装或路径变化时只确认一次 UAC。注册成功后不再弹出。
+        if (-not (Confirm-AdminTaskInstall)) {
+            Show-InstallCancelled (
+                '已取消首次安装说明，尚未请求 Windows UAC；' +
+                '管理员任务未安装，也没有启动游戏。重新运行一键入口即可继续。'
+            )
+            exit 2
+        }
         $quotedScript = '"' + $PSCommandPath.Replace('"', '\"') + '"'
         $elevatedArguments = @(
             '-NoProfile',
+            '-NonInteractive',
             '-ExecutionPolicy', 'Bypass',
             '-File', $quotedScript,
-            '-InstallElevated'
+            '-InstallElevated',
+            '-ExpectedScriptSha256', $scriptSnapshot.Sha256,
+            '-ExpectedConfigSha256', $configSnapshot.Sha256
         ) -join ' '
-        $installer = Start-Process `
-            -FilePath 'powershell.exe' `
-            -ArgumentList $elevatedArguments `
-            -Verb RunAs `
-            -WindowStyle Hidden `
-            -Wait `
-            -PassThru
+        try {
+            $installer = Start-Process `
+                -FilePath $SystemPowerShellPath `
+                -ArgumentList $elevatedArguments `
+                -Verb RunAs `
+                -WindowStyle Hidden `
+                -Wait `
+                -PassThru
+        }
+        catch {
+            if (Test-UacCancellation -Exception $_.Exception) {
+                Show-InstallCancelled (
+                    '已取消 Windows UAC 授权；首次安装尚未完成，' +
+                    '管理员任务未安装，也没有启动游戏。重新运行一键入口即可继续。'
+                )
+                exit 2
+            }
+            throw
+        }
         if ($installer.ExitCode -ne 0) {
             throw "管理员启动任务安装失败，退出码：$($installer.ExitCode)"
         }
@@ -1071,9 +2071,16 @@ try {
         -WorkingDirectory $ProjectRoot | Out-Null
 }
 catch {
+    $failure = $_.Exception
+    Write-InstallerFailure -Exception $failure
+    $hint = if ($InstallElevated) {
+        '本次管理员任务安装未完成；请按以上错误修复后重新安装。'
+    }
+    else {
+        '首次安装或任务定义变化时会请求一次 Windows UAC；若已经授权，以上错误就是安装失败原因。'
+    }
     Show-LaunchError (
-        "一键启动失败：$($_.Exception.Message)`n" +
-        '首次安装必须确认一次 Windows UAC；以后不会再次要求。'
+        "一键启动失败：$($failure.Message)`n" + $hint
     )
     exit 1
 }

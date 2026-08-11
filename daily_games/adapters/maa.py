@@ -90,6 +90,11 @@ class MaaAdapter(AdapterBase):
                     if bool(self._start_button_automation.get("enabled", False))
                     else ""
                 ),
+                expected_wrapper_executable=(
+                    str(self._game_cfg.get("game_executable", ""))
+                    if bool(self._start_button_automation.get("enabled", False))
+                    else ""
+                ),
             ):
                 problems.append("鹰角启动器管理员计划任务不存在或定义不匹配")
             details["start_button_automation_verified"] = bool(
@@ -220,7 +225,13 @@ class MaaAdapter(AdapterBase):
     def wait_game_ready(self, timeout_s: float, stop_event: object | None = None) -> StepResult:
         """等待 Arknights.exe 进程出现。"""
         name = str(self._game_cfg.get("game_process_name", "Arknights.exe"))
-        recs = self._pm.wait_for_process(name, timeout_s, stop_event)
+        game_path = str(self._game_cfg.get("game_executable", ""))
+        recs = self._pm.wait_for_process(
+            name,
+            timeout_s,
+            stop_event,
+            expected_path=game_path,
+        )
         if _stop_requested(stop_event):
             return StepResult(False, CODE_STOP_REQUESTED, "等待游戏进程时收到停止要求", {})
         if not recs:
@@ -284,7 +295,12 @@ class MaaAdapter(AdapterBase):
                 self._helper.get("scheduled_task_start_timeout_s", 30.0)
             )
             records = list(
-                self._pm.wait_for_process(helper_name, start_timeout, None)
+                self._pm.wait_for_process(
+                    helper_name,
+                    start_timeout,
+                    None,
+                    expected_path=str(self._helper.get("executable", "")),
+                )
             )
             if not records:
                 return StepResult(
@@ -342,8 +358,14 @@ class MaaAdapter(AdapterBase):
 
         game_name = str(self._game_cfg.get("game_process_name", "Arknights.exe"))
         helper_name = str(self._helper.get("process_name", "MAA.exe"))
-        initial_game_recs = list(self._pm.find_by_executable(game_name))
-        initial_helper_recs = list(self._pm.find_by_executable(helper_name))
+        game_path = str(self._game_cfg.get("game_executable", ""))
+        helper_path = str(self._helper.get("executable", ""))
+        initial_game_recs = list(
+            self._pm.find_by_executable(game_name, expected_path=game_path)
+        )
+        initial_helper_recs = list(
+            self._pm.find_by_executable(helper_name, expected_path=helper_path)
+        )
         if not initial_game_recs or not initial_helper_recs:
             missing = "game" if not initial_game_recs else "helper"
             return StepResult(
@@ -366,11 +388,17 @@ class MaaAdapter(AdapterBase):
                 return StepResult(False, CODE_STOP_REQUESTED, "等待完成时收到停止要求", {})
 
             game_recs = [
-                rec for rec in self._pm.find_by_executable(game_name)
+                rec
+                for rec in self._pm.find_by_executable(
+                    game_name, expected_path=game_path
+                )
                 if rec.pid not in exited_pids
             ]
             helper_recs = [
-                rec for rec in self._pm.find_by_executable(helper_name)
+                rec
+                for rec in self._pm.find_by_executable(
+                    helper_name, expected_path=helper_path
+                )
                 if rec.pid not in exited_pids
             ]
             self._claim_helper_handoffs(helper_recs)
@@ -387,11 +415,17 @@ class MaaAdapter(AdapterBase):
 
             # 再取一次快照，捕获旧 MAA 退出和管理员 MAA 出现之间的换 PID。
             new_game_recs = [
-                rec for rec in self._pm.find_by_executable(game_name)
+                rec
+                for rec in self._pm.find_by_executable(
+                    game_name, expected_path=game_path
+                )
                 if rec.pid not in exited_pids
             ]
             new_helper_recs = [
-                rec for rec in self._pm.find_by_executable(helper_name)
+                rec
+                for rec in self._pm.find_by_executable(
+                    helper_name, expected_path=helper_path
+                )
                 if rec.pid not in exited_pids
             ]
             self._claim_helper_handoffs(new_helper_recs)
@@ -498,7 +532,13 @@ class MaaAdapter(AdapterBase):
                 and create_time < self._helper_launch_time - 1.0
             ):
                 continue
-            claimed = take_ownership(record.pid)
+            claimed = take_ownership(
+                record.pid,
+                expected_path=str(self._helper.get("executable", "")),
+                expected_create_time=(
+                    create_time if create_time > 0.0 else None
+                ),
+            )
             if claimed is not None:
                 self._owned_helper_pids.add(record.pid)
 

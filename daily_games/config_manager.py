@@ -20,6 +20,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -101,6 +102,39 @@ class ConfigChange:
     warning: str
 
 
+@dataclass(frozen=True)
+class _ValidatedBackupEntry:
+    index: int
+    original_path: Path
+    original_name: str
+    backup_path: Path
+    backup_name: str
+    sha256: str
+    size: int
+
+
+@dataclass
+class _RestoreStage:
+    entry: _ValidatedBackupEntry
+    replacement_path: Path
+    rollback_path: Path | None
+    original_existed: bool
+    original_hash: str | None
+    committed: bool = False
+
+
+@dataclass
+class _ApplyStage:
+    target: Path
+    stage_directory: Path
+    staged_path: Path
+    rollback_path: Path
+    baseline_hash: str
+    desired_hash: str
+    results: list[CheckResult]
+    committed: bool = False
+
+
 class ConfigManagerError(Exception):
     """具有明确错误码和详情的自定义异常基类。"""
 
@@ -132,7 +166,7 @@ def _sha256(path: Path) -> str:
 def _file_meta(path: Path) -> dict[str, object]:
     stat = path.stat()
     return {
-        "absolute_path": str(path.resolve()),
+        "absolute_path": os.path.abspath(os.fspath(path)),
         "sha256": _sha256(path),
         "size": stat.st_size,
         "mtime": datetime.fromtimestamp(stat.st_mtime, timezone.utc).astimezone().isoformat(timespec="seconds"),
@@ -174,6 +208,197 @@ def _mask_sensitive(value: object) -> str:
             return "*" * len(value)
         return value[:2] + "*" * (len(value) - 4) + value[-2:]
     return value
+
+
+_BACKUP_ID_RE = re.compile(r"^[0-9a-f]{8}$", re.IGNORECASE)
+_BACKUP_DIRECTORY_RE = re.compile(
+    r"^(?P<timestamp>\d{8}T\d{6})_(?P<backup_id>[0-9a-f]{8})$",
+    re.IGNORECASE,
+)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+
+
+def _is_plain_file(path: Path) -> bool:
+    """仅接受普通文件，不跟随符号链接或 Windows 重解析点。"""
+    try:
+        file_stat = os.lstat(path)
+    except OSError:
+        return False
+    return bool(
+        stat.S_ISREG(file_stat.st_mode)
+        and not stat.S_ISLNK(file_stat.st_mode)
+        and not (
+            getattr(file_stat, "st_file_attributes", 0)
+            & _FILE_ATTRIBUTE_REPARSE_POINT
+        )
+    )
+
+
+def _is_plain_directory(path: Path) -> bool:
+    """仅接受普通目录，不跟随符号链接或 Windows 重解析点。"""
+    try:
+        directory_stat = os.lstat(path)
+    except OSError:
+        return False
+    return bool(
+        stat.S_ISDIR(directory_stat.st_mode)
+        and not stat.S_ISLNK(directory_stat.st_mode)
+        and not (
+            getattr(directory_stat, "st_file_attributes", 0)
+            & _FILE_ATTRIBUTE_REPARSE_POINT
+        )
+    )
+
+
+def _backup_manifest_error(message: str, **details: object) -> ConfigManagerError:
+    return ConfigManagerError(CODE_AMBIGUOUS, message, details)
+
+
+def _validate_backup_manifest(
+    manifest_path: Path,
+    manifest: object,
+    *,
+    expected_backup_id: str | None = None,
+    verify_payloads: bool,
+) -> tuple[BackupInfo, tuple[_ValidatedBackupEntry, ...]]:
+    """验证备份清单结构；可选核对每个备份文件的大小与哈希。"""
+    if not _is_plain_directory(manifest_path.parent) or not _is_plain_file(
+        manifest_path
+    ):
+        raise _backup_manifest_error("备份目录或清单不是普通文件")
+    directory_match = _BACKUP_DIRECTORY_RE.fullmatch(manifest_path.parent.name)
+    if directory_match is None:
+        raise _backup_manifest_error("备份目录名称格式无效")
+    try:
+        datetime.strptime(
+            directory_match.group("timestamp"),
+            "%Y%m%dT%H%M%S",
+        )
+    except ValueError as exc:
+        raise _backup_manifest_error("备份目录时间戳无效") from exc
+    if not isinstance(manifest, Mapping):
+        raise _backup_manifest_error("备份清单根节点必须是对象")
+
+    backup_id = manifest.get("backup_id")
+    if not isinstance(backup_id, str) or not _BACKUP_ID_RE.fullmatch(backup_id):
+        raise _backup_manifest_error("备份 ID 格式无效")
+    normalized_id = backup_id.casefold()
+    if directory_match.group("backup_id").casefold() != normalized_id:
+        raise _backup_manifest_error("备份目录与清单 ID 不一致")
+    if (
+        expected_backup_id is not None
+        and normalized_id != expected_backup_id.casefold()
+    ):
+        raise _backup_manifest_error("请求的备份 ID 与清单不一致")
+
+    created_at = manifest.get("created_at")
+    if not isinstance(created_at, str) or not created_at.strip():
+        raise _backup_manifest_error("备份建立时间无效")
+    try:
+        datetime.fromisoformat(created_at)
+    except ValueError as exc:
+        raise _backup_manifest_error("备份建立时间格式无效") from exc
+
+    source_count = manifest.get("source_count")
+    entries_raw = manifest.get("entries")
+    if (
+        type(source_count) is not int
+        or source_count <= 0
+        or not isinstance(entries_raw, list)
+        or len(entries_raw) != source_count
+    ):
+        raise _backup_manifest_error("备份文件数量与清单条目不一致")
+
+    validated: list[_ValidatedBackupEntry] = []
+    seen_originals: set[str] = set()
+    seen_backup_names: set[str] = set()
+    for position, raw_entry in enumerate(entries_raw):
+        if not isinstance(raw_entry, Mapping):
+            raise _backup_manifest_error("备份条目必须是对象", index=position)
+        index = raw_entry.get("index")
+        original_text = raw_entry.get("original_absolute_path")
+        absolute_text = raw_entry.get("absolute_path")
+        original_name = raw_entry.get("original_name")
+        backup_name = raw_entry.get("backup_name")
+        digest = raw_entry.get("sha256")
+        size = raw_entry.get("size")
+        if type(index) is not int or index != position:
+            raise _backup_manifest_error("备份条目索引不连续", index=position)
+        if not isinstance(original_text, str) or not original_text.strip():
+            raise _backup_manifest_error("备份原始路径无效", index=position)
+        original_path = Path(original_text)
+        if not original_path.is_absolute():
+            raise _backup_manifest_error("备份原始路径必须是绝对路径", index=position)
+        if (
+            not isinstance(absolute_text, str)
+            or _normalized_path(absolute_text) != _normalized_path(original_path)
+        ):
+            raise _backup_manifest_error("备份绝对路径字段不一致", index=position)
+        if (
+            not isinstance(original_name, str)
+            or not original_name
+            or original_name != original_path.name
+        ):
+            raise _backup_manifest_error("备份原始文件名无效", index=position)
+        expected_backup_name = f"{position:03d}_{original_name}"
+        if backup_name != expected_backup_name:
+            raise _backup_manifest_error("备份副本文件名无效", index=position)
+        if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+            raise _backup_manifest_error("备份 SHA-256 格式无效", index=position)
+        if type(size) is not int or size < 0:
+            raise _backup_manifest_error("备份文件大小无效", index=position)
+
+        normalized_original = _normalized_path(original_path)
+        if (
+            normalized_original in seen_originals
+            or backup_name in seen_backup_names
+        ):
+            raise _backup_manifest_error("备份清单含重复路径或副本", index=position)
+        seen_originals.add(normalized_original)
+        seen_backup_names.add(backup_name)
+        backup_path = manifest_path.parent / backup_name
+        entry = _ValidatedBackupEntry(
+            index=position,
+            original_path=original_path,
+            original_name=original_name,
+            backup_path=backup_path,
+            backup_name=backup_name,
+            sha256=digest.casefold(),
+            size=size,
+        )
+        if verify_payloads:
+            if not _is_plain_file(backup_path):
+                raise ConfigManagerError(
+                    CODE_FILE_NOT_FOUND,
+                    f"备份文件缺失或不是普通文件：{backup_path}",
+                    {"backup_name": backup_name},
+                )
+            payload_size = os.lstat(backup_path).st_size
+            if payload_size != size:
+                raise ConfigManagerError(
+                    CODE_HASH_MISMATCH,
+                    f"备份文件大小不符：{backup_path}",
+                    {"expected_size": size, "actual_size": payload_size},
+                )
+            actual_hash = _sha256(backup_path)
+            if actual_hash.casefold() != entry.sha256:
+                raise ConfigManagerError(
+                    CODE_HASH_MISMATCH,
+                    f"备份文件哈希不符：{backup_path}",
+                    {"expected": entry.sha256, "actual": actual_hash},
+                )
+        validated.append(entry)
+
+    return (
+        BackupInfo(
+            backup_id=normalized_id,
+            created_at=created_at,
+            manifest_path=manifest_path,
+            source_count=source_count,
+        ),
+        tuple(validated),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -922,8 +1147,10 @@ class ConfigManager:
         - 拒绝 unknown（不在规划表中的）change_id。
         - 拒绝重复的 change_id。
         - 拒绝 verified=False 的 change_id。
+        - 任一请求项目无效时整批拒绝，不应用有效子集。
         - 在任何写入前，统一为所有涉及的目标文件创建一份备份。
-        - 应用后重新解析验证；任一验证失败则记录原因并尝试恢复该文件。
+        - 先在同目录副本应用并验证全部变更，再逐项原子提交。
+        - 提交前复核原档与暂存档；中途失败时只回滚本轮已提交档案。
         """
         ids = list(change_ids)
         # 1. 去重与存在性检查
@@ -966,14 +1193,42 @@ class ConfigManager:
                 continue
             selected.append(spec)
 
-        if not selected:
+        # 任一请求项目无效时整批拒绝，不能只应用其中的有效子集。
+        if results or not selected:
             return results
 
-        # 2. 任何写入前统一备份所有涉及文件
-        cfg = self.load()
-        target_files = self._collect_target_files(selected, cfg)
+        # 2. 任何写入前统一解析目标并备份所有涉及文件。
         try:
+            cfg = self.load()
+            files_to_specs: dict[Path, list[dict[str, object]]] = {}
+            for spec in selected:
+                target = self._resolve_target_file(spec, cfg).resolve()
+                files_to_specs.setdefault(target, []).append(spec)
+            target_files = list(files_to_specs)
             backup = self.backup_files([str(p) for p in target_files])
+
+            # backup_files 已做发布前验证；这里再从已发布清单取得每个目标
+            # 的基线哈希与只读副本，后续不得改用备份完成后的现场内容。
+            with open(backup.manifest_path, "r", encoding="utf-8") as fh:
+                backup_manifest = json.load(fh)
+            _backup_info, backup_entries = _validate_backup_manifest(
+                backup.manifest_path,
+                backup_manifest,
+                expected_backup_id=backup.backup_id,
+                verify_payloads=True,
+            )
+            entries_by_target = {
+                _normalized_path(entry.original_path): entry
+                for entry in backup_entries
+            }
+            expected_targets = {
+                _normalized_path(target) for target in target_files
+            }
+            if set(entries_by_target) != expected_targets:
+                raise ConfigManagerError(
+                    CODE_BACKUP_FAILED,
+                    "备份清单与本次配置目标不一致",
+                )
             results.append(CheckResult(
                 name="backup",
                 ok=True,
@@ -992,17 +1247,325 @@ class ConfigManager:
                 details={"backup_error": exc.details},
             ))
             return results
+        except OSError as exc:
+            results.append(CheckResult(
+                name="backup",
+                ok=False,
+                code=CODE_BACKUP_FAILED,
+                message=f"备份失败，已中止应用：{exc}",
+                severity=SEVERITY_ERROR,
+                details={"error_type": type(exc).__name__},
+            ))
+            return results
+        except Exception as exc:
+            results.append(CheckResult(
+                name="apply.prepare",
+                ok=False,
+                code=CODE_INTERNAL,
+                message=f"配置准备异常，已中止应用：{type(exc).__name__}",
+                severity=SEVERITY_ERROR,
+                details={"error_type": type(exc).__name__},
+            ))
+            return results
 
-        # 3. 逐个文件应用
-        # 先按文件分组变更，避免重复读写同一个文件
-        files_to_specs: dict[Path, list[dict[str, object]]] = {}
-        for spec in selected:
-            p = self._resolve_target_file(spec, cfg)
-            files_to_specs.setdefault(p, []).append(spec)
-
+        # 3. 在各目标的同目录副本完成修改与验证，原档保持不变。
+        stages: list[_ApplyStage] = []
+        stage_directories: set[Path] = set()
+        stage_failed = False
         for target, file_specs in files_to_specs.items():
-            file_results = self._apply_specs_to_one_file(target, file_specs, cfg)
-            results.extend(file_results)
+            stage_directory: Path | None = None
+            try:
+                backup_entry = entries_by_target[_normalized_path(target)]
+                if not _is_plain_file(target):
+                    raise ConfigManagerError(
+                        CODE_FILE_NOT_FOUND,
+                        f"目标文件不存在或不是普通文件：{target}",
+                    )
+                baseline_hash = backup_entry.sha256.casefold()
+                if _sha256(target).casefold() != baseline_hash:
+                    raise ConfigManagerError(
+                        CODE_ATOMIC_REPLACE_FAILED,
+                        f"目标配置在备份后已被修改：{target}",
+                    )
+                stage_directory = Path(tempfile.mkdtemp(
+                    prefix=".daily_games_apply_",
+                    dir=str(target.parent),
+                ))
+                stage_directories.add(stage_directory)
+                staged_path = stage_directory / target.name
+                shutil.copy2(backup_entry.backup_path, staged_path)
+                if (
+                    not _is_plain_file(staged_path)
+                    or _sha256(staged_path).casefold() != baseline_hash
+                ):
+                    raise ConfigManagerError(
+                        CODE_HASH_MISMATCH,
+                        f"配置暂存副本哈希不符：{target}",
+                    )
+                staged_results = self._apply_specs_to_one_file(
+                    staged_path,
+                    file_specs,
+                    cfg,
+                )
+                staged_results = [
+                    CheckResult(
+                        name=result.name,
+                        ok=result.ok,
+                        code=result.code,
+                        message=result.message.replace(
+                            str(staged_path),
+                            str(target),
+                        ),
+                        severity=result.severity,
+                        details=result.details,
+                    )
+                    for result in staged_results
+                ]
+                if all(result.ok for result in staged_results):
+                    desired_hash = _sha256(staged_path).casefold()
+                    rollback_path = stage_directory / f".rollback_{target.name}"
+                    shutil.copy2(backup_entry.backup_path, rollback_path)
+                    if (
+                        not _is_plain_file(rollback_path)
+                        or _sha256(rollback_path).casefold() != baseline_hash
+                    ):
+                        raise ConfigManagerError(
+                            CODE_HASH_MISMATCH,
+                            f"配置回滚副本哈希不符：{target}",
+                        )
+            except Exception as exc:
+                code = exc.code if isinstance(exc, ConfigManagerError) else CODE_INTERNAL
+                message = (
+                    exc.message
+                    if isinstance(exc, ConfigManagerError)
+                    else f"{type(exc).__name__}"
+                )
+                results.append(CheckResult(
+                    name=f"apply.{target.name}",
+                    ok=False,
+                    code=code,
+                    message=f"配置暂存失败：{message}",
+                    severity=SEVERITY_ERROR,
+                    details={"path": str(target)},
+                ))
+                stage_failed = True
+                break
+            if any(not result.ok for result in staged_results):
+                results.extend(staged_results)
+                stage_failed = True
+                break
+            stages.append(_ApplyStage(
+                target=target,
+                stage_directory=stage_directory,
+                staged_path=staged_path,
+                rollback_path=rollback_path,
+                baseline_hash=baseline_hash,
+                desired_hash=desired_hash,
+                results=staged_results,
+            ))
+
+        if stage_failed:
+            for directory in stage_directories:
+                shutil.rmtree(directory, ignore_errors=True)
+            results.append(CheckResult(
+                name="apply.rollback",
+                ok=True,
+                code=CODE_OK,
+                message="配置暂存失败，本次未提交任何原始文件",
+                severity=SEVERITY_INFO,
+                details={"backup_id": backup.backup_id},
+            ))
+            return results
+
+        # 4. 提交前一次性核对所有原档、暂存档与回滚副本。
+        drifted: list[Path] = []
+        invalid_stages: list[Path] = []
+        for stage in stages:
+            try:
+                if (
+                    not _is_plain_file(stage.target)
+                    or _sha256(stage.target).casefold() != stage.baseline_hash
+                ):
+                    drifted.append(stage.target)
+            except OSError:
+                drifted.append(stage.target)
+            try:
+                if (
+                    not _is_plain_file(stage.staged_path)
+                    or _sha256(stage.staged_path).casefold() != stage.desired_hash
+                    or not _is_plain_file(stage.rollback_path)
+                    or _sha256(stage.rollback_path).casefold() != stage.baseline_hash
+                ):
+                    invalid_stages.append(stage.target)
+            except OSError:
+                invalid_stages.append(stage.target)
+        if drifted or invalid_stages:
+            for directory in stage_directories:
+                shutil.rmtree(directory, ignore_errors=True)
+            if drifted:
+                results.append(CheckResult(
+                    name="apply.concurrent_change",
+                    ok=False,
+                    code=CODE_ATOMIC_REPLACE_FAILED,
+                    message="目标配置在备份后被外部修改，已中止整批应用",
+                    severity=SEVERITY_ERROR,
+                    details={"paths": [str(path) for path in drifted]},
+                ))
+            if invalid_stages:
+                results.append(CheckResult(
+                    name="apply.stage_integrity",
+                    ok=False,
+                    code=CODE_HASH_MISMATCH,
+                    message="配置暂存或回滚副本完整性校验失败，已中止整批应用",
+                    severity=SEVERITY_ERROR,
+                    details={"paths": [str(path) for path in invalid_stages]},
+                ))
+            results.append(CheckResult(
+                name="apply.rollback",
+                ok=True,
+                code=CODE_OK,
+                message="尚未提交任何配置，无需回滚",
+                severity=SEVERITY_INFO,
+                details={"backup_id": backup.backup_id},
+            ))
+            return results
+
+        # 5. 同卷原子替换。每项提交前再次复核，缩小并发修改窗口。
+        commit_error: Exception | None = None
+        for stage in stages:
+            replace_attempted = False
+            try:
+                if (
+                    not _is_plain_file(stage.target)
+                    or _sha256(stage.target).casefold() != stage.baseline_hash
+                ):
+                    raise ConfigManagerError(
+                        CODE_ATOMIC_REPLACE_FAILED,
+                        f"目标配置在提交前已被修改：{stage.target}",
+                    )
+                if (
+                    not _is_plain_file(stage.staged_path)
+                    or _sha256(stage.staged_path).casefold() != stage.desired_hash
+                ):
+                    raise ConfigManagerError(
+                        CODE_HASH_MISMATCH,
+                        f"配置暂存副本在提交前已被修改：{stage.target}",
+                    )
+                if (
+                    not _is_plain_file(stage.rollback_path)
+                    or _sha256(stage.rollback_path).casefold() != stage.baseline_hash
+                ):
+                    raise ConfigManagerError(
+                        CODE_HASH_MISMATCH,
+                        f"配置回滚副本在提交前已被修改：{stage.target}",
+                    )
+                replace_attempted = True
+                os.replace(stage.staged_path, stage.target)
+                stage.committed = True
+                if _sha256(stage.target).casefold() != stage.desired_hash:
+                    raise ConfigManagerError(
+                        CODE_HASH_MISMATCH,
+                        f"配置提交后哈希不符：{stage.target}",
+                    )
+            except Exception as exc:
+                # os.replace 极少数平台错误可能在替换完成后才上报；若目标
+                # 已呈现期望哈希，仍视为已提交并纳入回滚范围。
+                if replace_attempted and not stage.committed:
+                    try:
+                        stage.committed = (
+                            _is_plain_file(stage.target)
+                            and _sha256(stage.target).casefold() == stage.desired_hash
+                        )
+                    except OSError:
+                        pass
+                commit_error = exc
+                break
+
+        if commit_error is not None:
+            commit_message = (
+                commit_error.message
+                if isinstance(commit_error, ConfigManagerError)
+                else type(commit_error).__name__
+            )
+            results.append(CheckResult(
+                name="apply.commit",
+                ok=False,
+                code=(
+                    commit_error.code
+                    if isinstance(commit_error, ConfigManagerError)
+                    else CODE_ATOMIC_REPLACE_FAILED
+                ),
+                message=f"配置提交失败：{commit_message}",
+                severity=SEVERITY_ERROR,
+                details={},
+            ))
+
+            committed_count = sum(1 for stage in stages if stage.committed)
+            rollback_errors: list[str] = []
+            for stage in reversed(stages):
+                if not stage.committed:
+                    continue
+                try:
+                    if not _is_plain_file(stage.target):
+                        raise OSError("提交后的目标不是普通文件")
+                    current_hash = _sha256(stage.target).casefold()
+                    if current_hash == stage.baseline_hash:
+                        stage.committed = False
+                        continue
+                    if current_hash != stage.desired_hash:
+                        raise OSError("提交后的目标又被外部修改")
+                    if (
+                        not _is_plain_file(stage.rollback_path)
+                        or _sha256(stage.rollback_path).casefold()
+                        != stage.baseline_hash
+                    ):
+                        raise OSError("回滚副本完整性校验失败")
+                    os.replace(stage.rollback_path, stage.target)
+                    if _sha256(stage.target).casefold() != stage.baseline_hash:
+                        raise OSError("回滚后哈希不符")
+                    stage.committed = False
+                except Exception as exc:
+                    # 若 replace 已生效但随后抛错，以现场哈希作为最终判断。
+                    try:
+                        recovered = (
+                            _is_plain_file(stage.target)
+                            and _sha256(stage.target).casefold()
+                            == stage.baseline_hash
+                        )
+                    except OSError:
+                        recovered = False
+                    if recovered:
+                        stage.committed = False
+                    else:
+                        rollback_errors.append(
+                            f"{stage.target.name}: {type(exc).__name__}"
+                        )
+
+            rollback_ok = not rollback_errors
+            results.append(CheckResult(
+                name="apply.rollback",
+                ok=rollback_ok,
+                code=CODE_OK if rollback_ok else CODE_ATOMIC_REPLACE_FAILED,
+                message=(
+                    "配置应用失败，已恢复本轮已提交档案"
+                    if rollback_ok and committed_count
+                    else "尚未提交任何配置，无需回滚"
+                    if rollback_ok
+                    else "配置应用失败，自动回滚未完成"
+                ),
+                severity=SEVERITY_INFO if rollback_ok else SEVERITY_ERROR,
+                details={
+                    "backup_id": backup.backup_id,
+                    "committed_count": committed_count,
+                    "errors": rollback_errors,
+                },
+            ))
+        else:
+            for stage in stages:
+                results.extend(stage.results)
+
+        for directory in stage_directories:
+            shutil.rmtree(directory, ignore_errors=True)
 
         return results
 
@@ -1016,24 +1579,65 @@ class ConfigManager:
         列表记录原始绝对路径、SHA-256、大小、修改时间。
         任一文件不存在或读取失败则整体失败（不创建部分备份）。
         """
-        src_paths = [_coerce_path(p) for p in paths]
-        # 先全部验证存在
+        # abspath 只做词法绝对化，不跟随符号链接或重解析点；随后才能对调用者
+        # 实际指定的目录项执行 lstat 安全检查。
+        src_paths = [
+            Path(os.path.abspath(os.fspath(_coerce_path(p))))
+            for p in paths
+        ]
+        if not src_paths:
+            raise ConfigManagerError(
+                CODE_AMBIGUOUS,
+                "待备份文件列表为空",
+            )
+        normalized_sources = [_normalized_path(path) for path in src_paths]
+        if len(set(normalized_sources)) != len(normalized_sources):
+            raise ConfigManagerError(
+                CODE_AMBIGUOUS,
+                "待备份文件列表含重复路径",
+            )
+        # 先全部验证存在，并拒绝符号链接或 Windows 重解析点。
         for p in src_paths:
-            if not p.is_file():
+            if not _is_plain_file(p):
                 raise ConfigManagerError(
                     CODE_FILE_NOT_FOUND,
-                    f"待备份文件不存在：{p}",
+                    f"待备份文件不存在或不是普通文件：{p}",
                     {"path": str(p)},
+                )
+
+        backup_root = Path(os.path.abspath(os.fspath(self._backup_root)))
+        if os.path.lexists(backup_root):
+            if not _is_plain_directory(backup_root):
+                raise ConfigManagerError(
+                    CODE_AMBIGUOUS,
+                    f"备份根目录不是普通目录：{backup_root}",
+                    {"path": str(backup_root)},
+                )
+        else:
+            backup_root.mkdir(parents=True, exist_ok=False)
+            if not _is_plain_directory(backup_root):
+                raise ConfigManagerError(
+                    CODE_AMBIGUOUS,
+                    f"无法建立普通备份根目录：{backup_root}",
+                    {"path": str(backup_root)},
                 )
 
         backup_id = secrets.token_hex(4)
         ts = datetime.now(timezone.utc).astimezone().strftime("%Y%m%dT%H%M%S")
         # 时间戳目录 + 短随机后缀避免同秒冲突
-        dest_dir = self._backup_root / f"{ts}_{backup_id}"
-        dest_dir.mkdir(parents=True, exist_ok=False)
+        dest_dir = backup_root / f"{ts}_{backup_id}"
+        dest_dir.mkdir(exist_ok=False)
+        if (
+            not _is_plain_directory(backup_root)
+            or not _is_plain_directory(dest_dir)
+        ):
+            raise ConfigManagerError(
+                CODE_AMBIGUOUS,
+                "备份目录在建立后未通过普通目录检查",
+                {"path": str(dest_dir)},
+            )
 
         manifest_entries: list[dict[str, object]] = []
-        copied: list[Path] = []
         try:
             for idx, p in enumerate(src_paths):
                 meta = _file_meta(p)
@@ -1041,7 +1645,6 @@ class ConfigManager:
                 safe_name = f"{idx:03d}_{p.name}"
                 dest = dest_dir / safe_name
                 shutil.copy2(p, dest)
-                copied.append(dest)
                 # 重新计算哈希确认复制完整
                 dest_meta = _file_meta(dest)
                 if dest_meta["sha256"] != meta["sha256"]:
@@ -1052,25 +1655,34 @@ class ConfigManager:
                     )
                 manifest_entries.append({
                     "index": idx,
-                    "original_absolute_path": str(p.resolve()),
+                    "original_absolute_path": str(p),
                     "original_name": p.name,
                     "backup_name": safe_name,
                     **meta,
                 })
+            manifest = {
+                "backup_id": backup_id,
+                "created_at": _now_iso(),
+                "source_root_hint": str(backup_root),
+                "source_count": len(src_paths),
+                "entries": manifest_entries,
+            }
+            manifest_path = dest_dir / "manifest.json"
+            _atomic_write_text(
+                manifest_path,
+                json.dumps(manifest, indent=2, ensure_ascii=False),
+            )
+            # 回读并验证清单及全部副本，成功后才发布 BackupInfo。
+            _validate_backup_manifest(
+                manifest_path,
+                manifest,
+                expected_backup_id=backup_id,
+                verify_payloads=True,
+            )
         except Exception:
             # 清理已创建的备份目录，避免部分备份
             shutil.rmtree(dest_dir, ignore_errors=True)
             raise
-
-        manifest = {
-            "backup_id": backup_id,
-            "created_at": _now_iso(),
-            "source_root_hint": str(self._backup_root),
-            "source_count": len(src_paths),
-            "entries": manifest_entries,
-        }
-        manifest_path = dest_dir / "manifest.json"
-        _atomic_write_text(manifest_path, json.dumps(manifest, indent=2, ensure_ascii=False))
         return BackupInfo(
             backup_id=backup_id,
             created_at=manifest["created_at"],
@@ -1091,7 +1703,7 @@ class ConfigManager:
         先写临时文件、重新解析验证后再原子替换。
         """
         target = _coerce_path(path)
-        if not target.is_file():
+        if not _is_plain_file(target):
             return [CheckResult(
                 name=f"patch_json.{target.name}",
                 ok=False,
@@ -1129,7 +1741,8 @@ class ConfigManager:
             if ok:
                 changed = True
 
-        if not changed:
+        # 单次请求具有整批语义；任何键失败时不得写入其余有效键。
+        if any(not result.ok for result in results) or not changed:
             return results
 
         # 串行化、原子替换、重新解析验证
@@ -1181,7 +1794,7 @@ class ConfigManager:
         updates 的值仅支持字符串；调用者负责格式化（例如 true/false/数字以字符串表示）。
         """
         target = _coerce_path(path)
-        if not target.is_file():
+        if not _is_plain_file(target):
             return [CheckResult(
                 name=f"patch_yaml.{target.name}",
                 ok=False,
@@ -1279,7 +1892,8 @@ class ConfigManager:
                 details={"key": key, "indent": indent, "line": line_idx + 1},
             ))
 
-        if not any_applied:
+        # 单次请求具有整批语义；任何键失败时不得写入其余有效键。
+        if any(not result.ok for result in results) or not any_applied:
             return results
 
         # 原子替换 + 重新解析验证
@@ -1315,66 +1929,134 @@ class ConfigManager:
     def list_backups(self) -> list[BackupInfo]:
         """列出 backup_root 下的所有备份，并按时间排序。"""
         infos: list[BackupInfo] = []
-        if not self._backup_root.is_dir():
+        if not _is_plain_directory(self._backup_root):
             return infos
-        for entry in sorted(self._backup_root.iterdir()):
-            if not entry.is_dir():
+        try:
+            root_entries = sorted(self._backup_root.iterdir())
+        except OSError:
+            return infos
+        for entry in root_entries:
+            if not _is_plain_directory(entry):
                 continue
             manifest = entry / "manifest.json"
-            if not manifest.is_file():
+            if not _is_plain_file(manifest):
                 continue
             try:
                 with open(manifest, "r", encoding="utf-8") as fh:
                     m = json.load(fh)
-            except (OSError, json.JSONDecodeError):
+                info, _entries = _validate_backup_manifest(
+                    manifest,
+                    m,
+                    verify_payloads=False,
+                )
+            except (
+                ConfigManagerError,
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
                 continue
-            infos.append(BackupInfo(
-                backup_id=str(m.get("backup_id", entry.name)),
-                created_at=str(m.get("created_at", "")),
-                manifest_path=manifest,
-                source_count=int(m.get("source_count", 0)),
-            ))
-        return infos
+            infos.append(info)
+        id_counts: dict[str, int] = {}
+        for info in infos:
+            id_counts[info.backup_id] = id_counts.get(info.backup_id, 0) + 1
+        return [info for info in infos if id_counts[info.backup_id] == 1]
 
     def restore_backup(self, backup_id: str) -> list[CheckResult]:
         """恢复指定备份。
 
         恢复前先再次备份各文件的当前版本（避免部分恢复后无法回退），
-        然后逐个文件核对哈希，并从备份复制回原路径。
+        并在任何目标写入前验证全部副本、准备同目录替换文件与回滚文件。
+        提交或写后验证失败时，已提交目标会倒序恢复原状。
         """
-        # 找到对应备份目录
-        manifest_path, manifest = self._find_backup_manifest(backup_id)
+        try:
+            manifest_path, manifest = self._find_backup_manifest(backup_id)
+        except OSError as exc:
+            return [CheckResult(
+                name="restore.lookup",
+                ok=False,
+                code=CODE_BACKUP_FAILED,
+                message=f"无法读取备份目录：{exc}",
+                severity=SEVERITY_ERROR,
+                details={"backup_id": backup_id, "error_type": type(exc).__name__},
+            )]
+        except Exception as exc:
+            return [CheckResult(
+                name="restore.lookup",
+                ok=False,
+                code=CODE_INTERNAL,
+                message=f"查找备份时发生异常：{type(exc).__name__}",
+                severity=SEVERITY_ERROR,
+                details={"backup_id": backup_id, "error_type": type(exc).__name__},
+            )]
         if manifest is None:
             return [CheckResult(
                 name="restore",
                 ok=False,
                 code=CODE_FILE_NOT_FOUND,
-                message=f"找不到备份：{backup_id}",
+                message=f"找不到唯一且有效的备份：{backup_id}",
                 severity=SEVERITY_ERROR,
                 details={"backup_id": backup_id},
             )]
 
-        entries = manifest.get("entries", [])
-        if not entries:
+        try:
+            backup_info, entries = _validate_backup_manifest(
+                manifest_path,
+                manifest,
+                expected_backup_id=backup_id,
+                verify_payloads=True,
+            )
+        except Exception as exc:
+            code = (
+                exc.code
+                if isinstance(exc, ConfigManagerError)
+                else CODE_BACKUP_FAILED
+                if isinstance(exc, OSError)
+                else CODE_INTERNAL
+            )
+            message = (
+                exc.message
+                if isinstance(exc, ConfigManagerError)
+                else str(exc)
+                if isinstance(exc, OSError)
+                else type(exc).__name__
+            )
+            error_details = (
+                exc.details if isinstance(exc, ConfigManagerError) else {}
+            )
             return [CheckResult(
-                name="restore",
+                name="restore.validate",
                 ok=False,
-                code=CODE_AMBIGUOUS,
-                message="备份列表为空，无法恢复",
+                code=code,
+                message=f"备份验证失败：{message}",
                 severity=SEVERITY_ERROR,
-                details={"backup_id": backup_id},
+                details={
+                    "backup_id": backup_id,
+                    "error": error_details,
+                    "error_type": type(exc).__name__,
+                },
             )]
 
         results: list[CheckResult] = []
+        for entry in entries:
+            target = entry.original_path
+            if os.path.lexists(target) and not _is_plain_file(target):
+                return [CheckResult(
+                    name=f"restore.{entry.original_name}",
+                    ok=False,
+                    code=CODE_AMBIGUOUS,
+                    message=f"恢复目标不是普通文件：{target}",
+                    severity=SEVERITY_ERROR,
+                    details={"path": str(target)},
+                )]
 
-        # 1. 恢复前先把“当前版本”再备份一次（仅针对仍存在的文件）
-        current_paths: list[str] = []
-        backup_dir = manifest_path.parent
-        for e in entries:
-            orig = e.get("original_absolute_path")
-            if orig and Path(orig).is_file():
-                current_paths.append(orig)
-        pre_restore_backup: BackupInfo | None = None
+        # 1. 恢复前把所有既存目标再备份一次。
+        current_paths = [
+            str(entry.original_path)
+            for entry in entries
+            if _is_plain_file(entry.original_path)
+        ]
         if current_paths:
             try:
                 pre_restore_backup = self.backup_files(current_paths)
@@ -1386,98 +2068,274 @@ class ConfigManager:
                     severity=SEVERITY_INFO,
                     details={"pre_backup_id": pre_restore_backup.backup_id},
                 ))
-            except ConfigManagerError as exc:
+            except Exception as exc:
+                code = (
+                    exc.code
+                    if isinstance(exc, ConfigManagerError)
+                    else CODE_BACKUP_FAILED
+                    if isinstance(exc, OSError)
+                    else CODE_INTERNAL
+                )
+                message = (
+                    exc.message
+                    if isinstance(exc, ConfigManagerError)
+                    else str(exc)
+                    if isinstance(exc, OSError)
+                    else type(exc).__name__
+                )
+                error_details = (
+                    exc.details if isinstance(exc, ConfigManagerError) else {}
+                )
                 results.append(CheckResult(
                     name="restore.pre_backup",
                     ok=False,
-                    code=exc.code,
-                    message=f"恢复前备份失败，已中止恢复：{exc.message}",
+                    code=code,
+                    message=f"恢复前备份失败，已中止恢复：{message}",
                     severity=SEVERITY_ERROR,
-                    details={"error": exc.details},
+                    details={
+                        "error": error_details,
+                        "error_type": type(exc).__name__,
+                    },
                 ))
                 return results
 
-        # 2. 逐个文件核对备份哈希并复制回原路径
-        restored_any = False
-        for e in entries:
-            orig = Path(str(e["original_absolute_path"]))
-            backup_file = backup_dir / str(e["backup_name"])
-            expected_hash = str(e["sha256"])
-            name = f"restore.{e.get('original_name', orig.name)}"
+        # 2. 在每个目标的同目录准备替换文件与原状回滚文件，不改动目标。
+        stages: list[_RestoreStage] = []
+        temporary_paths: set[Path] = set()
+        try:
+            for entry in entries:
+                target = entry.original_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                original_existed = _is_plain_file(target)
+                original_hash: str | None = None
+                rollback_path: Path | None = None
+                if original_existed:
+                    original_hash = _sha256(target)
+                    rollback_fd, rollback_name = tempfile.mkstemp(
+                        prefix=".restore_rollback_",
+                        suffix=target.suffix,
+                        dir=str(target.parent),
+                    )
+                    os.close(rollback_fd)
+                    rollback_path = Path(rollback_name)
+                    temporary_paths.add(rollback_path)
+                    shutil.copy2(target, rollback_path)
+                    if _sha256(rollback_path) != original_hash:
+                        raise ConfigManagerError(
+                            CODE_HASH_MISMATCH,
+                            f"恢复前回滚副本哈希不符：{target}",
+                        )
 
-            if not backup_file.is_file():
-                results.append(CheckResult(
-                    name=name,
-                    ok=False,
-                    code=CODE_FILE_NOT_FOUND,
-                    message=f"备份文件缺失：{backup_file}",
-                    severity=SEVERITY_ERROR,
-                    details={},
+                replacement_fd, replacement_name = tempfile.mkstemp(
+                    prefix=".restore_new_",
+                    suffix=target.suffix,
+                    dir=str(target.parent),
+                )
+                os.close(replacement_fd)
+                replacement_path = Path(replacement_name)
+                temporary_paths.add(replacement_path)
+                shutil.copy2(entry.backup_path, replacement_path)
+                if _sha256(replacement_path).casefold() != entry.sha256:
+                    raise ConfigManagerError(
+                        CODE_HASH_MISMATCH,
+                        f"恢复暂存副本哈希不符：{target}",
+                    )
+                stages.append(_RestoreStage(
+                    entry=entry,
+                    replacement_path=replacement_path,
+                    rollback_path=rollback_path,
+                    original_existed=original_existed,
+                    original_hash=original_hash,
                 ))
-                continue
-            actual_hash = _sha256(backup_file)
-            if actual_hash != expected_hash:
-                results.append(CheckResult(
-                    name=name,
+        except Exception as exc:
+            for temporary in temporary_paths:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            code = (
+                exc.code
+                if isinstance(exc, ConfigManagerError)
+                else CODE_ATOMIC_REPLACE_FAILED
+                if isinstance(exc, OSError)
+                else CODE_INTERNAL
+            )
+            message = (
+                exc.message
+                if isinstance(exc, ConfigManagerError)
+                else str(exc)
+                if isinstance(exc, OSError)
+                else type(exc).__name__
+            )
+            results.extend([
+                CheckResult(
+                    name="restore.stage",
                     ok=False,
-                    code=CODE_HASH_MISMATCH,
-                    message=f"备份文件哈希不符：{backup_file}",
+                    code=code,
+                    message=f"恢复暂存失败，目标未修改：{message}",
                     severity=SEVERITY_ERROR,
-                    details={"expected": expected_hash, "actual": actual_hash},
-                ))
-                continue
+                    details={"backup_id": backup_info.backup_id},
+                ),
+                CheckResult(
+                    name="restore.summary",
+                    ok=False,
+                    code=code,
+                    message="未恢复任何文件",
+                    severity=SEVERITY_ERROR,
+                    details={"backup_id": backup_info.backup_id},
+                ),
+            ])
+            return results
 
-            # 确保父目录存在后原子复制
-            try:
-                orig.parent.mkdir(parents=True, exist_ok=True)
-                # 复制到暂存再替换
-                fd, tmp_name = tempfile.mkstemp(prefix=".restore_", dir=str(orig.parent))
-                tmp_path = Path(tmp_name)
-                os.close(fd)
-                shutil.copy2(backup_file, tmp_path)
-                os.replace(tmp_path, orig)
-            except OSError as exc:
-                results.append(CheckResult(
-                    name=name,
-                    ok=False,
-                    code=CODE_ATOMIC_REPLACE_FAILED,
-                    message=f"恢复写入失败：{exc}",
-                    severity=SEVERITY_ERROR,
-                    details={},
-                ))
-                continue
+        # 3. 再次核对目标未被并发修改，然后逐项原子提交并做写后验证。
+        commit_error: Exception | None = None
+        try:
+            for stage in stages:
+                target = stage.entry.original_path
+                if stage.original_existed:
+                    if (
+                        not _is_plain_file(target)
+                        or _sha256(target) != stage.original_hash
+                    ):
+                        raise ConfigManagerError(
+                            CODE_ATOMIC_REPLACE_FAILED,
+                            f"恢复目标在提交前已被修改：{target}",
+                        )
+                elif os.path.lexists(target):
+                    raise ConfigManagerError(
+                        CODE_ATOMIC_REPLACE_FAILED,
+                        f"恢复目标在提交前已出现：{target}",
+                    )
+                os.replace(stage.replacement_path, target)
+                temporary_paths.discard(stage.replacement_path)
+                stage.committed = True
+                actual_hash = _sha256(target)
+                if actual_hash.casefold() != stage.entry.sha256:
+                    raise ConfigManagerError(
+                        CODE_HASH_MISMATCH,
+                        f"恢复后哈希不符：{target}",
+                    )
+        except Exception as exc:
+            commit_error = exc
 
-            # 复制后再次核对
-            after_hash = _sha256(orig)
-            if after_hash != expected_hash:
-                results.append(CheckResult(
-                    name=name,
-                    ok=False,
-                    code=CODE_HASH_MISMATCH,
-                    message=f"恢复后哈希不符：{orig}",
-                    severity=SEVERITY_ERROR,
-                    details={"expected": expected_hash, "actual": after_hash},
-                ))
-                continue
+        if commit_error is not None:
+            rollback_errors: list[str] = []
+            for stage in reversed(stages):
+                if not stage.committed:
+                    continue
+                target = stage.entry.original_path
+                try:
+                    if stage.original_existed:
+                        if stage.rollback_path is None:
+                            raise OSError("缺少回滚暂存文件")
+                        if not _is_plain_file(target):
+                            raise OSError("提交后的目标不是普通文件")
+                        current_hash = _sha256(target).casefold()
+                        if current_hash == str(stage.original_hash).casefold():
+                            stage.committed = False
+                            continue
+                        if current_hash != stage.entry.sha256:
+                            raise OSError("提交后的目标又被外部修改")
+                        if (
+                            not _is_plain_file(stage.rollback_path)
+                            or _sha256(stage.rollback_path).casefold()
+                            != str(stage.original_hash).casefold()
+                        ):
+                            raise OSError("回滚副本完整性校验失败")
+                        os.replace(stage.rollback_path, target)
+                        temporary_paths.discard(stage.rollback_path)
+                        if _sha256(target) != stage.original_hash:
+                            raise OSError("回滚后哈希不符")
+                        stage.committed = False
+                    else:
+                        if os.path.lexists(target):
+                            if (
+                                not _is_plain_file(target)
+                                or _sha256(target).casefold()
+                                != stage.entry.sha256
+                            ):
+                                raise OSError("本轮新建目标又被外部修改")
+                            target.unlink()
+                        if os.path.lexists(target):
+                            raise OSError("无法移除本轮新建目标")
+                        stage.committed = False
+                except Exception as rollback_exc:
+                    rollback_errors.append(
+                        f"{stage.entry.original_name}: {type(rollback_exc).__name__}"
+                    )
 
-            restored_any = True
+            code = (
+                commit_error.code
+                if isinstance(commit_error, ConfigManagerError)
+                else CODE_ATOMIC_REPLACE_FAILED
+            )
+            message = (
+                commit_error.message
+                if isinstance(commit_error, ConfigManagerError)
+                else str(commit_error)
+            )
             results.append(CheckResult(
-                name=name,
+                name="restore.commit",
+                ok=False,
+                code=code,
+                message=f"恢复提交失败：{message}",
+                severity=SEVERITY_ERROR,
+                details={"backup_id": backup_info.backup_id},
+            ))
+            results.append(CheckResult(
+                name="restore.rollback",
+                ok=not rollback_errors,
+                code=CODE_OK if not rollback_errors else CODE_ATOMIC_REPLACE_FAILED,
+                message=(
+                    "已恢复提交前状态"
+                    if not rollback_errors
+                    else "部分目标无法自动回滚"
+                ),
+                severity=SEVERITY_INFO if not rollback_errors else SEVERITY_ERROR,
+                details={"errors": rollback_errors},
+            ))
+            results.append(CheckResult(
+                name="restore.summary",
+                ok=False,
+                code=code,
+                message="恢复未完成",
+                severity=SEVERITY_ERROR,
+                details={"backup_id": backup_info.backup_id},
+            ))
+        else:
+            for stage in stages:
+                results.append(CheckResult(
+                    name=f"restore.{stage.entry.original_name}",
+                    ok=True,
+                    code=CODE_OK,
+                    message=f"已恢复：{stage.entry.original_path}",
+                    severity=SEVERITY_INFO,
+                    details={"path": str(stage.entry.original_path)},
+                ))
+            results.append(CheckResult(
+                name="restore.summary",
                 ok=True,
                 code=CODE_OK,
-                message=f"已恢复：{orig}",
+                message="恢复完成",
                 severity=SEVERITY_INFO,
-                details={"path": str(orig)},
+                details={"backup_id": backup_info.backup_id},
             ))
 
-        results.append(CheckResult(
-            name="restore.summary",
-            ok=restored_any,
-            code=CODE_OK if restored_any else CODE_AMBIGUOUS,
-            message=("恢复完成" if restored_any else "未恢复任何文件"),
-            severity=SEVERITY_INFO if restored_any else SEVERITY_WARNING,
-            details={"backup_id": backup_id},
-        ))
+        # 成功或已完成回滚后清理尚存暂存文件；回滚失败的副本会保留供人工恢复。
+        preserve = {
+            stage.rollback_path
+            for stage in stages
+            if stage.committed
+            and stage.original_existed
+            and stage.rollback_path is not None
+            and stage.rollback_path.exists()
+            and commit_error is not None
+        }
+        for temporary in temporary_paths - preserve:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
         return results
 
     # ================================================================== #
@@ -1978,29 +2836,39 @@ class ConfigManager:
         return True, "写入后验证通过"
 
     def _find_backup_manifest(self, backup_id: str) -> tuple[Path, dict[str, Any] | None]:
-        if not self._backup_root.is_dir():
+        if (
+            not _is_plain_directory(self._backup_root)
+            or not isinstance(backup_id, str)
+            or not _BACKUP_ID_RE.fullmatch(backup_id)
+        ):
             return Path(), None
-        # 先尝试目录名后缀比较（格式 <ts>_<id>）
-        candidates: list[Path] = []
+        candidates: list[tuple[Path, dict[str, Any]]] = []
         for entry in self._backup_root.iterdir():
-            if entry.is_dir() and entry.name.endswith(f"_{backup_id}"):
-                candidates.append(entry / "manifest.json")
-        # 也比较 manifest 内 backup_id
-        for entry in self._backup_root.iterdir():
-            if entry.is_dir():
-                mpath = entry / "manifest.json"
-                if mpath.is_file() and mpath not in candidates:
-                    candidates.append(mpath)
-        for mpath in candidates:
-            if not mpath.is_file():
+            if not _is_plain_directory(entry):
+                continue
+            mpath = entry / "manifest.json"
+            if not _is_plain_file(mpath):
                 continue
             try:
                 with open(mpath, "r", encoding="utf-8") as fh:
                     m = json.load(fh)
-            except (OSError, json.JSONDecodeError):
+                _validate_backup_manifest(
+                    mpath,
+                    m,
+                    expected_backup_id=backup_id,
+                    verify_payloads=False,
+                )
+            except (
+                ConfigManagerError,
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
                 continue
-            if str(m.get("backup_id")) == backup_id or mpath.parent.name.endswith(f"_{backup_id}"):
-                return mpath, m
+            candidates.append((mpath, dict(m)))
+        if len(candidates) == 1:
+            return candidates[0]
         return Path(), None
 
 

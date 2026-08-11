@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 import uuid
 from dataclasses import dataclass, field
@@ -135,6 +136,35 @@ class EntrypointTests(unittest.TestCase):
         self.assertEqual(stdout.reconfigure_calls, [{"encoding": "utf-8", "errors": "replace"}])
         self.assertEqual(stderr.reconfigure_calls, [{"encoding": "utf-8", "errors": "replace"}])
         self.assertIn("中文检查", stdout.getvalue())
+
+    @unittest.skipUnless(os.name == "nt", "MessageBoxW 仅在 Windows 上可用")
+    def test_default_gui_error_reporter_declares_unicode_message_box_signature(self):
+        entrypoint = load_entrypoint()
+        message_box = mock.Mock(return_value=1)
+        user32 = mock.Mock()
+        user32.MessageBoxW = message_box
+
+        with mock.patch.object(
+            entrypoint.ctypes,
+            "WinDLL",
+            return_value=user32,
+        ):
+            entrypoint._default_gui_error_reporter("测试错误")
+
+        self.assertEqual(
+            message_box.argtypes,
+            [
+                entrypoint.ctypes.c_void_p,
+                entrypoint.ctypes.c_wchar_p,
+                entrypoint.ctypes.c_wchar_p,
+                entrypoint.ctypes.c_uint32,
+            ],
+        )
+        self.assertIs(message_box.restype, entrypoint.ctypes.c_int)
+        self.assertEqual(
+            message_box.call_args.args,
+            (None, "测试错误", "一键日常", 0x00000010),
+        )
 
     def test_unavailable_default_streams_are_ignored_and_injected_streams_are_untouched(self):
         entrypoint = load_entrypoint()
@@ -376,6 +406,10 @@ class EntrypointTests(unittest.TestCase):
         self.assertIn("%~dp0", source)
         self.assertIn("daily_games_launcher.ps1", source)
         self.assertIn("powershell.exe", lowered)
+        self.assertIn(
+            "%systemroot%\\system32\\windowspowershell\\v1.0\\powershell.exe",
+            lowered,
+        )
         self.assertNotIn("d:\\daily", lowered)
         self.assertTrue(all(byte < 128 for byte in raw))
         self.assertIn(b"\r\n", raw)
@@ -397,6 +431,27 @@ class EntrypointTests(unittest.TestCase):
         self.assertIn("register-scheduledtask", lowered)
         self.assertIn("-runlevel highest", lowered)
         self.assertIn("-verb runas", lowered)
+        self.assertIn("$systempowershellpath", lowered)
+        self.assertIn("initialize-trustedpowershellenvironment", lowered)
+        self.assertIn("microsoft.powershell.security.psd1", lowered)
+        self.assertIn("scheduledtasks.psd1", lowered)
+        self.assertNotIn("-filepath 'powershell.exe'", lowered)
+        self.assertNotIn("join-path $pshome 'powershell.exe'", lowered)
+        self.assertIn("[security.principal.ntaccount]::new", lowered)
+        self.assertIn("translate([security.principal.securityidentifier])", lowered)
+        self.assertNotIn("$expectedusers", lowered)
+        self.assertIn("confirm-admintaskinstall", lowered)
+        self.assertIn("system.windows.forms.messagebox", lowered)
+        self.assertIn("无法显示安装说明时失败关闭", source)
+        self.assertIn("test-uaccancellation", lowered)
+        self.assertIn("$expectedscriptsha256", lowered)
+        self.assertIn("$expectedconfigsha256", lowered)
+        self.assertIn("get-filesnapshot", lowered)
+        self.assertIn("[system.io.file]::readallbytes", lowered)
+        self.assertIn("配置在请求 UAC 前后发生变化", source)
+        self.assertIn("启动脚本在请求 UAC 前后发生变化", source)
+        self.assertIn("首次安装或安全组件更新需要一次 windows uac 授权", lowered)
+        self.assertIn("已取消 windows uac 授权", lowered)
         self.assertIn("$repairtasks", lowered)
         self.assertIn("if ($repairtasks)", lowered)
         self.assertIn("invoke-softwarepathselfcheck", lowered)
@@ -405,7 +460,7 @@ class EntrypointTests(unittest.TestCase):
         self.assertNotIn("$repairarguments", lowered)
         self.assertLess(
             lowered.rfind("invoke-softwarepathselfcheck -pythonwpath"),
-            lowered.rfind("$specs = @(get-admintaskspecs)"),
+            lowered.rfind("$configsnapshot = get-filesnapshot -path $configpath"),
         )
         self.assertNotIn("start-scheduledtask", lowered)
         self.assertNotIn("d:\\daily", lowered)
@@ -413,13 +468,26 @@ class EntrypointTests(unittest.TestCase):
         self.assertNotIn("mouse_event", lowered)
         self.assertIn("uiautomationclient", lowered)
         self.assertIn("sendinput", lowered)
+        self.assertIn("windowfrompoint", lowered)
+        self.assertIn("getancestor", lowered)
         self.assertIn("getwindowthreadprocessid", lowered)
         self.assertIn("attachthreadinput", lowered)
         self.assertIn("get-authenticodesignature", lowered)
-        self.assertIn("game_selected_by_verified_position", lowered)
+        self.assertIn("test-launcherexecutableidentity", lowered)
+        self.assertIn("launcher_identity_mismatch", lowered)
+        self.assertIn("test-verifiedtargetgameprocess", lowered)
+        self.assertIn("target_executable", lowered)
+        self.assertNotIn(
+            "if (get-process -name '__process_name__'",
+            lowered,
+        )
+        self.assertIn("game_selection_clicked_by_verified_position", lowered)
+        self.assertIn("game_selection_confirmed_by_accessibility", lowered)
+        self.assertIn("game_selection_not_observable", lowered)
+        self.assertIn("unexpected_game_started", lowered)
         self.assertIn("launcher_button_automation.log", lowered)
         self.assertIn("test-verifiedlauncherwindow", lowered)
-        self.assertIn("daily_games_launcher_worker_v3", lowered)
+        self.assertIn("daily_games_launcher_worker_v4", lowered)
         self.assertIn("launcher_dispatched", lowered)
         self.assertIn("launcher_dispatch_failed", lowered)
         self.assertIn("find-launcherwindowcandidate", lowered)
@@ -427,13 +495,236 @@ class EntrypointTests(unittest.TestCase):
         self.assertIn("native_type_load_failed", lowered)
         self.assertIn("-filepath '__launcher_executable__'", lowered)
         self.assertIn("-erroraction stop", lowered)
-        self.assertIn(".generated", lowered)
+        self.assertIn("commonapplicationdata", lowered)
+        self.assertIn("test-protectedworkerpath", lowered)
+        self.assertIn("areaccessrulesprotected", lowered)
+        self.assertIn("set-acl", lowered)
+        self.assertIn("filesystemrights]::writedata", lowered)
+        self.assertNotIn("filesystemrights]::modify -bor", lowered)
+        self.assertNotIn("join-path $projectroot '.generated'", lowered)
+        self.assertIn("test-tasksecuritycontract", lowered)
+        self.assertIn("$task.triggers", lowered)
+        self.assertIn("$triggercount -eq 0", lowered)
+        self.assertIn("new-admininstallstate", lowered)
+        self.assertIn("restore-admininstallstates", lowered)
+        self.assertIn("restore-launcherworkerstate", lowered)
+        self.assertIn("export-scheduledtask", lowered)
+        self.assertIn("已回滚本轮任务与包装脚本", source)
+        self.assertIn("allowdemandstart", lowered)
+        self.assertIn("executiontimelimit", lowered)
+        self.assertIn("write-installerfailure", lowered)
+        self.assertIn("installer_error.log", lowered)
+        self.assertIn("本次管理员任务安装未完成", source)
         self.assertIn("expectedsha256", lowered)
         self.assertIn("get-filehash", lowered)
         self.assertNotIn("-encodedcommand", lowered)
         self.assertIn("if ($actions.count -ne 1)", lowered)
         self.assertNotIn("postaction", lowered)
         self.assertIn("开始游戏", source)
+
+        install_notice = lowered.rfind("if (-not (confirm-admintaskinstall))")
+        uac_prompt = lowered.rfind("-verb runas")
+        self.assertGreater(install_notice, 0)
+        self.assertLess(install_notice, uac_prompt)
+
+        identity_check = lowered.index(
+            "if (-not (test-launcherexecutableidentity))"
+        )
+        launcher_dispatch = lowered.index(
+            "-filepath '__launcher_executable__'",
+            identity_check,
+        )
+        self.assertLess(identity_check, launcher_dispatch)
+
+        click_at = lowered.index("public static bool clickat")
+        move_cursor = lowered.index("if (!setcursorpos(x, y))", click_at)
+        hit_test = lowered.index("windowfrompoint(clickpoint)", move_cursor)
+        send_input = lowered.index("uint sent = sendinput", hit_test)
+        final_foreground_check = lowered.rfind(
+            "getforegroundwindow()", move_cursor, send_input
+        )
+        restore_finally = lowered.index("finally", send_input)
+        restore_cursor = lowered.index(
+            "setcursorpos(oldpoint.x, oldpoint.y)", restore_finally
+        )
+        self.assertGreater(final_foreground_check, move_cursor)
+        self.assertLess(hit_test, send_input)
+        self.assertGreater(restore_cursor, send_input)
+
+    @unittest.skipUnless(os.name == "nt", "Windows PowerShell 任务回滚行为")
+    def test_admin_task_install_rolls_back_changed_and_new_tasks_on_failure(self):
+        launcher = ROOT / "daily_games_launcher.ps1"
+        escaped_launcher = str(launcher).replace("'", "''")
+        powershell = (
+            Path(os.environ["SystemRoot"])
+            / "System32"
+            / "WindowsPowerShell"
+            / "v1.0"
+            / "powershell.exe"
+        )
+        harness = rf"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    '{escaped_launcher}',
+    [ref]$tokens,
+    [ref]$parseErrors
+)
+if ($parseErrors.Count -ne 0) {{ throw 'launcher parse failed' }}
+foreach ($functionName in @(
+    'New-AdminInstallState',
+    'Restore-LauncherWorkerState',
+    'Restore-AdminInstallStates',
+    'Install-AdminTask'
+)) {{
+    $definition = @($ast.FindAll({{
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $functionName
+    }}, $true))
+    if ($definition.Count -ne 1) {{ throw "missing function: $functionName" }}
+    Invoke-Expression $definition[0].Extent.Text
+}}
+
+$EntryPath = [System.IO.Path]::GetTempFileName()
+$ConfigPath = 'unused-config.json'
+$script:tasks = @{{
+    'Task-A' = [pscustomobject]@{{ Version = 'old' }}
+}}
+try {{
+    function Test-IsAdministrator {{ return $true }}
+    function Get-FileSnapshot {{
+        param($Path)
+        return [pscustomobject]@{{
+            Bytes = [byte[]](1)
+            Sha256 = ('A' * 64)
+        }}
+    }}
+    function Get-AdminTaskSpecs {{
+        param($ConfigBytes)
+        return @(
+            [pscustomobject]@{{
+                TaskName = 'Task-A'; Executable = 'a.exe'
+                WorkingDirectory = 'C:\'; Arguments = ''
+                WorkerPath = ''; WorkerSha256 = ''
+            }},
+            [pscustomobject]@{{
+                TaskName = 'Task-B'; Executable = 'b.exe'
+                WorkingDirectory = 'C:\'; Arguments = ''
+                WorkerPath = ''; WorkerSha256 = ''
+            }},
+            [pscustomobject]@{{
+                TaskName = 'Task-C'; Executable = 'c.exe'
+                WorkingDirectory = 'C:\'; Arguments = ''
+                WorkerPath = ''; WorkerSha256 = ''
+            }}
+        )
+    }}
+    function Get-ScheduledTask {{
+        param($TaskName, $ErrorAction)
+        if ($script:tasks.ContainsKey($TaskName)) {{
+            return $script:tasks[$TaskName]
+        }}
+        return $null
+    }}
+    function Test-TaskMatchesProject {{
+        param($Task, $Spec)
+        return $Task.Version -eq 'new'
+    }}
+    function Test-TaskDefinitionMatchesSpec {{
+        param($Task, $Spec)
+        return $Task.Version -eq 'new'
+    }}
+    function Export-ScheduledTask {{
+        param($InputObject, $ErrorAction)
+        return '<Task version="old" />'
+    }}
+    function New-ScheduledTaskPrincipal {{
+        param($UserId, $LogonType, $RunLevel)
+        return [pscustomobject]@{{}}
+    }}
+    function New-ScheduledTaskSettingsSet {{
+        param(
+            [switch]$AllowStartIfOnBatteries,
+            [switch]$DontStopIfGoingOnBatteries,
+            $ExecutionTimeLimit,
+            $MultipleInstances
+        )
+        return [pscustomobject]@{{}}
+    }}
+    function Initialize-ProtectedWorkerDirectory {{}}
+    function Write-LauncherWorker {{ param($Spec) }}
+    function New-ScheduledTaskAction {{
+        param($Execute, $WorkingDirectory, $Argument)
+        return [pscustomobject]@{{ Execute = $Execute }}
+    }}
+    function New-ScheduledTask {{
+        param($Action, $Principal, $Settings)
+        return [pscustomobject]@{{ Version = 'new' }}
+    }}
+    function Register-ScheduledTask {{
+        param($TaskName, $InputObject, $Xml, [switch]$Force, $ErrorAction)
+        if (-not [string]::IsNullOrWhiteSpace([string]$Xml)) {{
+            $script:tasks[$TaskName] = [pscustomobject]@{{ Version = 'old' }}
+            return
+        }}
+        if ($TaskName -eq 'Task-C') {{ throw 'simulated register failure' }}
+        $script:tasks[$TaskName] = [pscustomobject]@{{ Version = 'new' }}
+    }}
+    function Unregister-ScheduledTask {{
+        param($TaskName, [bool]$Confirm, $ErrorAction)
+        [void]$script:tasks.Remove($TaskName)
+    }}
+
+    $caught = $null
+    try {{
+        Install-AdminTask -ExpectedConfigHash ('A' * 64)
+    }}
+    catch {{
+        $caught = $_.Exception
+    }}
+    if ($null -eq $caught) {{ throw 'expected install failure was not raised' }}
+    if (-not $script:tasks.ContainsKey('Task-A')) {{ throw 'old task missing' }}
+    if ($script:tasks['Task-A'].Version -ne 'old') {{ throw 'old task not restored' }}
+    if ($script:tasks.ContainsKey('Task-B')) {{ throw 'new task was not removed' }}
+    if ($script:tasks.ContainsKey('Task-C')) {{ throw 'failed task unexpectedly exists' }}
+    if ($null -eq $caught.InnerException) {{ throw 'original failure was not retained' }}
+    if ($caught.InnerException.Message -ne 'simulated register failure') {{
+        throw 'wrong original failure retained'
+    }}
+    'ADMIN_INSTALL_ROLLBACK_OK'
+}}
+finally {{
+    Remove-Item -LiteralPath $EntryPath -Force -ErrorAction SilentlyContinue
+}}
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            harness_path = Path(temp_dir) / "admin_install_rollback_test.ps1"
+            # Windows PowerShell 5.1 需 BOM 才会稳定按 UTF-8 读取脚本。
+            harness_path.write_text(harness, encoding="utf-8-sig")
+            completed = subprocess.run(
+                [
+                    str(powershell),
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(harness_path),
+                ],
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"stdout={completed.stdout}\nstderr={completed.stderr}",
+        )
+        self.assertIn("ADMIN_INSTALL_ROLLBACK_OK", completed.stdout)
 
     def test_production_launcher_uses_verified_game_ids_and_debug_logging(self):
         config = json.loads(

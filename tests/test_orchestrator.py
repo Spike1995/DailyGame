@@ -505,6 +505,51 @@ class OrchestratorTests(unittest.TestCase):
                 log_text,
             )
 
+    def test_log_evidence_redacts_structured_and_text_credentials(self):
+        logger = FakeLogger()
+        orchestrator = make_orchestrator(logger=logger)
+        orchestrator._log_step_evidence(
+            "arknights",
+            "start_helper",
+            Step(details={
+                "pid": 42,
+                "command": [
+                    "tool.exe",
+                    "--token",
+                    "SENTINEL_SPLIT",
+                    "--api-key=SENTINEL_EQUALS",
+                    "--header",
+                    "Authorization: Bearer SENTINEL_BEARER",
+                    {"password": "SENTINEL_MAPPING", "mode": "safe"},
+                ],
+            }),
+        )
+        orchestrator._log(
+            "warning",
+            (
+                "--secret SENTINEL_TEXT "
+                "Authorization: Bearer SENTINEL_DIRECT "
+                "/token SENTINEL_SLASH "
+                '--password "SENTINEL QUOTED SPACE"'
+            ),
+        )
+
+        messages = "\n".join(message for _, message in logger.entries)
+        for sentinel in (
+            "SENTINEL_SPLIT",
+            "SENTINEL_EQUALS",
+            "SENTINEL_BEARER",
+            "SENTINEL_MAPPING",
+            "SENTINEL_TEXT",
+            "SENTINEL_DIRECT",
+            "SENTINEL_SLASH",
+            "SENTINEL QUOTED SPACE",
+        ):
+            self.assertNotIn(sentinel, messages)
+        self.assertIn("<已脱敏>", messages)
+        self.assertIn("tool.exe", messages)
+        self.assertIn("safe", messages)
+
     def test_next_game_starts_only_after_previous_game_and_helper_exit(self):
         trace: list[str] = []
         monitor = SequenceProcessMonitor(trace=trace)
@@ -757,6 +802,33 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(report.stopped)
         self.assertEqual(report.results[0].state, STATE_STOPPED)
         self.assertEqual(blocking.calls[-1], "cleanup")
+
+    def test_per_game_completion_timeout_overrides_global_value(self):
+        blocking = BlockingWaitAdapter()
+        config = {
+            "timeouts": {
+                "game_process_s": 3,
+                "game_window_s": 7,
+                "completion_s": 13,
+            },
+            "games": {
+                "limbus": {"timeouts": {"completion_s": 10800}},
+            },
+        }
+        orchestrator = make_orchestrator(
+            config=config,
+            adapters=make_adapters(limbus=blocking),
+        )
+        thread, box = run_in_thread(lambda: orchestrator.run_one("limbus"))
+        self.assertTrue(blocking.entered.wait(2))
+        self.assertEqual(blocking.wait_game_args[0][0], 7.0)
+        self.assertEqual(blocking.wait_completion_args[0][0], 10800.0)
+
+        orchestrator.request_stop()
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("error", box)
+        self.assertTrue(box["result"].stopped)
 
     def test_stopped_listener_can_observe_running_until_run_finally_finishes(self):
         blocking = BlockingWaitAdapter()

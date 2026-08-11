@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import tkinter as tk
 import tkinter.font as tkfont
@@ -33,6 +34,46 @@ ASSET_DIR = Path(__file__).resolve().parent.parent / "assets" / "game_icons"
 POLL_INTERVAL_MS = 100
 STOP_EXIT_TIMEOUT_MS = 30_000
 AUTO_EXIT_SUCCESS_DELAY_MS = 3_000
+
+
+def resolve_log_directories(
+    config_path: str | os.PathLike[str],
+    *,
+    program_data: str | os.PathLike[str] | None = None,
+) -> tuple[Path, ...]:
+    """返回一般运行日志与已安装的受保护启动器日志目录。"""
+    config_file = Path(config_path).resolve()
+    default_logs = config_file.parent.parent / "logs"
+    primary = default_logs
+    try:
+        config = json.loads(config_file.read_text(encoding="utf-8"))
+        paths = config.get("paths", {}) if isinstance(config, dict) else {}
+        configured = paths.get("logs_dir") if isinstance(paths, dict) else None
+        if isinstance(configured, str) and configured.strip():
+            primary = Path(configured)
+            if not primary.is_absolute():
+                primary = config_file.parent.parent / primary
+            primary = primary.resolve()
+    except (OSError, UnicodeError, ValueError, TypeError):
+        primary = default_logs
+
+    directories = [primary]
+    common_data = program_data
+    if common_data is None:
+        common_data = os.environ.get("ProgramData")
+    if common_data:
+        protected_logs = Path(common_data) / "DailyGames" / "logs"
+        if protected_logs.is_dir():
+            directories.append(protected_logs)
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for directory in directories:
+        key = os.path.normcase(os.path.abspath(directory))
+        if key not in seen:
+            seen.add(key)
+            unique.append(directory)
+    return tuple(unique)
 
 
 # 视觉令牌集中定义，避免主界面和弹窗各自出现近似但不一致的颜色。
@@ -1239,9 +1280,10 @@ class DailyGamesApp:
 
     def _on_open_logs(self):
         try:
-            logs_dir = Path(self.config_path).resolve().parent.parent / "logs"
-            logs_dir.mkdir(parents=True, exist_ok=True)
-            os.startfile(logs_dir)  # type: ignore[attr-defined]  # Windows
+            directories = resolve_log_directories(self.config_path)
+            directories[0].mkdir(parents=True, exist_ok=True)
+            for directory in directories:
+                os.startfile(directory)  # type: ignore[attr-defined]  # Windows
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"打开日志目录失败：{exc!r}")
 
@@ -1250,7 +1292,11 @@ def _enable_dpi_awareness():
     try:
         import ctypes
 
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        shcore = ctypes.WinDLL("shcore", use_last_error=True)
+        set_process_dpi_awareness = shcore.SetProcessDpiAwareness
+        set_process_dpi_awareness.argtypes = [ctypes.c_int]
+        set_process_dpi_awareness.restype = ctypes.c_long
+        set_process_dpi_awareness(2)
     except Exception:  # noqa: BLE001 - DPI 配置失败不影响功能
         pass
 
@@ -1261,16 +1307,24 @@ def _enable_dark_title_bar(window):
         import ctypes
 
         window.update_idletasks()
-        user32 = ctypes.windll.user32
-        dwmapi = ctypes.windll.dwmapi
-        user32.GetParent.argtypes = (ctypes.c_void_p,)
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+        user32.GetParent.argtypes = [ctypes.c_void_p]
         user32.GetParent.restype = ctypes.c_void_p
-        hwnd = user32.GetParent(window.winfo_id()) or window.winfo_id()
+        dwmapi.DwmSetWindowAttribute.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+        window_handle = int(window.winfo_id())
+        hwnd = user32.GetParent(ctypes.c_void_p(window_handle)) or window_handle
         enabled = ctypes.c_int(1)
         for attribute in (20, 19):
             result = dwmapi.DwmSetWindowAttribute(
                 ctypes.c_void_p(hwnd),
-                ctypes.c_uint(attribute),
+                attribute,
                 ctypes.byref(enabled),
                 ctypes.sizeof(enabled),
             )
