@@ -78,29 +78,32 @@ def resolve_log_directories(
 
 # 视觉令牌集中定义，避免主界面和弹窗各自出现近似但不一致的颜色。
 COLORS = {
-    "background": "#090C12",
-    "surface": "#111722",
-    "surface_alt": "#171E2B",
-    "surface_hover": "#202A3A",
-    "log_background": "#0C111A",
-    "border": "#263143",
-    "border_soft": "#1D2634",
-    "text": "#F3F6FB",
-    "text_muted": "#98A4B7",
-    "text_subtle": "#667287",
-    "primary": "#6AA6FF",
-    "primary_hover": "#89B9FF",
-    "primary_pressed": "#4C88E5",
-    "success": "#46D39A",
-    "warning": "#F4C463",
-    "danger": "#F07676",
-    "disabled": "#354052",
+    "background": "#0A0D13",
+    "content_background": "#0F141F",
+    "surface": "#161D2C",
+    "surface_alt": "#1E2637",
+    "surface_hover": "#28324A",
+    "log_background": "#0B0F18",
+    "border": "#2B3549",
+    "border_soft": "#20293A",
+    "text": "#F0F4FA",
+    "text_muted": "#97A3B6",
+    "text_subtle": "#626D81",
+    "primary": "#5E9BFF",
+    "primary_hover": "#7FB2FF",
+    "primary_pressed": "#4A85E8",
+    "on_primary": "#0A1424",
+    "success": "#3ED3A0",
+    "warning": "#F4C763",
+    "danger": "#F27E7E",
+    "disabled": "#39445A",
 }
 
 GAME_APPEARANCE = {
     "arknights": {
         "index": "01",
         "latin_name": "ARKNIGHTS",
+        "short_name": "明日方舟",
         "helper": "MAA",
         "accent": "#58C7E8",
         "icon": "arknights.png",
@@ -109,6 +112,7 @@ GAME_APPEARANCE = {
     "endfield": {
         "index": "02",
         "latin_name": "ENDFIELD",
+        "short_name": "终末地",
         "helper": "MaaEnd",
         "accent": "#E5C35B",
         "icon": "endfield.png",
@@ -117,6 +121,7 @@ GAME_APPEARANCE = {
     "limbus": {
         "index": "03",
         "latin_name": "LIMBUS COMPANY",
+        "short_name": "边狱巴士",
         "helper": "AALC",
         "accent": "#E78150",
         "icon": "limbus.png",
@@ -141,6 +146,354 @@ STATE_COLORS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# 自定义控件：纯 Tk 实现，不引入第三方主题包
+# ---------------------------------------------------------------------------
+
+def _parent_background(widget):
+    """读取父控件底色；ttk 控件或读取失败时回退到主背景色。"""
+    try:
+        value = widget.cget("background")
+    except tk.TclError:
+        value = ""
+    return value or COLORS["background"]
+
+
+def _hex_to_rgb(color):
+    color = color.lstrip("#")
+    return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _hex_mix(color_a, color_b, ratio):
+    """把 color_a 按 ratio 混向 color_b（0 = 纯 a，1 = 纯 b）。"""
+    red_a, green_a, blue_a = _hex_to_rgb(color_a)
+    red_b, green_b, blue_b = _hex_to_rgb(color_b)
+    return "#{:02X}{:02X}{:02X}".format(
+        round(red_a + (red_b - red_a) * ratio),
+        round(green_a + (green_b - green_a) * ratio),
+        round(blue_a + (blue_b - blue_a) * ratio),
+    )
+
+
+def _rounded_rect(canvas, x1, y1, x2, y2, radius, **kwargs):
+    """在 Canvas 上绘制圆角矩形并返回 item id。"""
+    radius = max(0.0, min(radius, (x2 - x1) / 2, (y2 - y1) / 2))
+    if radius <= 0:
+        return canvas.create_rectangle(x1, y1, x2, y2, **kwargs)
+    points = [
+        x1 + radius, y1,
+        x2 - radius, y1,
+        x2, y1,
+        x2, y1 + radius,
+        x2, y2 - radius,
+        x2, y2,
+        x2 - radius, y2,
+        x1 + radius, y2,
+        x1, y2,
+        x1, y2 - radius,
+        x1, y1 + radius,
+        x1, y1,
+    ]
+    return canvas.create_polygon(points, smooth=True, **kwargs)
+
+
+class RoundedPanel(tk.Canvas):
+    """圆角面板容器。
+
+    Canvas 负责绘制圆角底板与描边，实际内容放入 ``content`` 帧；
+    面板尺寸随内容自适应，被 grid / pack 拉伸时底板自动重绘。
+    """
+
+    def __init__(self, parent, *, radius=14, background, border=None,
+                 padding=0, parent_background=None, decorate=None):
+        super().__init__(
+            parent, highlightthickness=0, bd=0,
+            background=parent_background or _parent_background(parent),
+        )
+        self._radius = radius
+        self._fill = background
+        self._border = border
+        self._padding = padding
+        self._fitting = False
+        self._decorate = decorate
+        self.content = tk.Frame(self, background=background)
+        self._content_window = self.create_window(
+            padding, padding, anchor="nw", window=self.content,
+        )
+        self.content.bind("<Configure>", self._fit_content)
+        self.bind("<Configure>", self._redraw)
+
+    def set_border(self, color):
+        """切换描边颜色（例如按卡片状态描边）；无变化时不重绘。"""
+        if color != self._border:
+            self._border = color
+            self._redraw()
+
+    def fit(self):
+        """按内容需求钉住请求尺寸。
+
+        Canvas 未显式设置宽高时请求尺寸会退化为内容项的包围盒，
+        进而把拉伸后的实际尺寸当成新的请求尺寸不断放大；内容填充完
+        成后必须调用本方法钉住请求尺寸。"""
+        self._fit_content()
+
+    def _fit_content(self, _event=None):
+        # 请求尺寸始终跟随内容需求（可增可减）；pack/grid 拉伸只影响
+        # 实际分配尺寸，不反过来抬高请求尺寸，避免与布局管理器互相拉扯。
+        if self._fitting:
+            return
+        width = self.content.winfo_reqwidth() + 2 * self._padding
+        height = self.content.winfo_reqheight() + 2 * self._padding
+        if (width, height) != (self.winfo_reqwidth(), self.winfo_reqheight()):
+            self._fitting = True
+            try:
+                self.configure(width=width, height=height)
+            finally:
+                self._fitting = False
+
+    def _redraw(self, _event=None):
+        width = max(self.winfo_width(), 1)
+        height = max(self.winfo_height(), 1)
+        self.coords(self._content_window, self._padding, self._padding)
+        self.itemconfigure(
+            self._content_window,
+            width=max(width - 2 * self._padding, 1),
+            height=max(height - 2 * self._padding, 1),
+        )
+        self.delete("panel")
+        if self._border:
+            _rounded_rect(
+                self, 1, 1, width - 2, height - 2, self._radius,
+                fill=self._fill, outline=self._border, width=1,
+                tags="panel",
+            )
+        else:
+            _rounded_rect(
+                self, 0, 0, width - 1, height - 1, self._radius,
+                fill=self._fill, outline="", tags="panel",
+            )
+        if self._decorate is not None:
+            self._decorate(self, width, height)
+        self.tag_lower("panel")
+
+
+_BUTTON_VARIANTS = {
+    "primary": {
+        "background": COLORS["primary"],
+        "foreground": COLORS["on_primary"],
+        "hover_background": COLORS["primary_hover"],
+        "pressed_background": COLORS["primary_pressed"],
+        "disabled_background": COLORS["border_soft"],
+        "disabled_foreground": COLORS["disabled"],
+    },
+    "secondary": {
+        "background": COLORS["surface_alt"],
+        "foreground": COLORS["text"],
+        "hover_background": COLORS["surface_hover"],
+        "pressed_background": COLORS["border"],
+        "disabled_background": COLORS["border_soft"],
+        "disabled_foreground": COLORS["disabled"],
+    },
+    "danger": {
+        "background": "#402227",
+        "foreground": "#FFA8A8",
+        "hover_background": "#52292F",
+        "pressed_background": "#331B20",
+        "disabled_background": COLORS["border_soft"],
+        "disabled_foreground": COLORS["disabled"],
+    },
+    "ghost": {
+        "background": None,
+        "foreground": COLORS["text_muted"],
+        "hover_background": COLORS["surface_alt"],
+        "hover_foreground": COLORS["text"],
+        "pressed_background": COLORS["border_soft"],
+        "disabled_background": None,
+        "disabled_foreground": COLORS["disabled"],
+    },
+    "card": {
+        "background": COLORS["surface_alt"],
+        "foreground": COLORS["text_muted"],
+        "hover_background": COLORS["surface_hover"],
+        "hover_foreground": COLORS["text"],
+        "pressed_background": COLORS["border"],
+        "disabled_background": COLORS["border_soft"],
+        "disabled_foreground": COLORS["disabled"],
+    },
+}
+
+
+class FlatButton(tk.Canvas):
+    """圆角扁平按钮，支持悬停 / 按下 / 禁用状态。
+
+    提供与 ttk 兼容的 ``state(["disabled"] / ["!disabled"])`` 接口，
+    以沿用既有的控件启用逻辑。``background=None`` 的变体底色跟随父级，
+    呈现透明（幽灵）效果。
+    """
+
+    def __init__(self, parent, text, command=None, *, variant="secondary",
+                 parent_background=None, font=("Microsoft YaHei UI", 10, "bold"),
+                 padx=18, height=36, radius=10):
+        self._variant = _BUTTON_VARIANTS[variant]
+        self._command = command
+        self._font = font
+        self._text = text
+        self._padx = padx
+        self._radius = radius
+        self._enabled = True
+        self._hover = False
+        self._pressed = False
+        text_width = tkfont.Font(font=font).measure(text)
+        super().__init__(
+            parent, width=text_width + 2 * padx, height=height,
+            highlightthickness=0, bd=0,
+            background=parent_background or _parent_background(parent),
+            cursor="hand2",
+        )
+        self.bind("<Configure>", self._redraw)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    def state(self, states):
+        """ttk 兼容接口：仅识别 disabled / !disabled。"""
+        if isinstance(states, str):
+            states = (states,)
+        for item in states:
+            if item == "disabled":
+                self._set_enabled(False)
+            elif item == "!disabled":
+                self._set_enabled(True)
+
+    def invoke(self):
+        if self._enabled and self._command is not None:
+            return self._command()
+        return None
+
+    def _set_enabled(self, enabled):
+        enabled = bool(enabled)
+        if enabled != self._enabled:
+            self._enabled = enabled
+            self.configure(cursor="hand2" if enabled else "arrow")
+            self._redraw()
+
+    def _colors(self):
+        if not self._enabled:
+            fill = self._variant["disabled_background"]
+            foreground = self._variant["disabled_foreground"]
+        elif self._pressed:
+            fill = self._variant["pressed_background"]
+            foreground = self._variant["foreground"]
+        elif self._hover:
+            fill = self._variant["hover_background"]
+            foreground = self._variant.get(
+                "hover_foreground", self._variant["foreground"]
+            )
+        else:
+            fill = self._variant["background"]
+            foreground = self._variant["foreground"]
+        if fill is None:
+            fill = self.cget("background")
+        return fill, foreground
+
+    def _redraw(self, _event=None):
+        # 字体回退可能让实际渲染宽于测量值；分配宽度不足时自动撑开，
+        # 避免文本被画布边缘裁切。
+        needed = tkfont.Font(font=self._font).measure(self._text) + 2 * self._padx
+        if self.winfo_width() < needed:
+            self.configure(width=needed)
+            return
+        width = max(self.winfo_width(), 1)
+        height = max(self.winfo_height(), 1)
+        fill, foreground = self._colors()
+        self.delete("all")
+        _rounded_rect(
+            self, 0, 0, width - 1, height - 1, self._radius,
+            fill=fill, outline="", tags="button",
+        )
+        self.create_text(
+            width / 2, height / 2, text=self._text, fill=foreground,
+            font=self._font, tags="button",
+        )
+
+    def _on_enter(self, _event):
+        if self._enabled:
+            self._hover = True
+            self._redraw()
+
+    def _on_leave(self, _event):
+        self._hover = False
+        self._pressed = False
+        self._redraw()
+
+    def _on_press(self, _event):
+        if self._enabled:
+            self._pressed = True
+            self._redraw()
+
+    def _on_release(self, event):
+        was_pressed = self._pressed
+        self._pressed = False
+        self._redraw()
+        inside = 0 <= event.x <= self.winfo_width() and (
+            0 <= event.y <= self.winfo_height()
+        )
+        if self._enabled and was_pressed and inside:
+            self.invoke()
+
+
+class StatusPill(tk.Canvas):
+    """胶囊状态徽标：圆点 + 彩色文本，底色为状态色的深色混合。"""
+
+    def __init__(self, parent, *, tint_base, parent_background=None,
+                 font=("Microsoft YaHei UI", 9, "bold"), height=26, padx=12):
+        super().__init__(
+            parent, height=height, width=padx * 2,
+            highlightthickness=0, bd=0,
+            background=parent_background or _parent_background(parent),
+        )
+        self._font = font
+        self._padx = padx
+        self._tint_base = tint_base
+        self._text = ""
+        self._color = COLORS["text_subtle"]
+        self.bind("<Configure>", self._redraw)
+
+    def set(self, text, color):
+        """更新徽标文本与状态色；底色按状态色向面板底色混合。"""
+        self._text = text
+        self._color = color
+        text_width = tkfont.Font(font=self._font).measure(text)
+        self.configure(width=text_width + 2 * self._padx + 12)
+        self._redraw()
+        # 徽标变宽会抬高所在面板的请求尺寸，通知面板重新钉住。
+        ancestor = self.master
+        while ancestor is not None and not isinstance(ancestor, RoundedPanel):
+            ancestor = getattr(ancestor, "master", None)
+        if ancestor is not None:
+            ancestor.fit()
+
+    def _redraw(self, _event=None):
+        width = max(self.winfo_width(), 1)
+        height = max(self.winfo_height(), 1)
+        tint = _hex_mix(self._color, self._tint_base, 0.86)
+        self.delete("all")
+        _rounded_rect(
+            self, 0, 0, width - 1, height - 1, height / 2,
+            fill=tint, outline="", tags="pill",
+        )
+        center_y = height / 2
+        self.create_oval(
+            self._padx - 3, center_y - 3, self._padx + 3, center_y + 3,
+            fill=self._color, outline="", tags="pill",
+        )
+        self.create_text(
+            self._padx + 12, center_y, text=self._text, anchor="w",
+            fill=self._color, font=self._font, tags="pill",
+        )
+
+
 class DailyGamesApp:
     """主窗口。orchestrator 以注入方式提供，测试可传入测试替身。"""
 
@@ -160,15 +513,14 @@ class DailyGamesApp:
         self._initial_check_results = []
 
         root.title("一键日常")
-        root.minsize(920, 680)
+        root.minsize(1160, 780)
         root.configure(background=COLORS["background"])
 
-        self._card_state_vars = {}
         self._card_msg_vars = {}
         self._card_err_vars = {}
         self._card_frames = {}
-        self._card_state_labels = {}
-        self._card_state_dots = {}
+        self._card_state_pills = {}
+        self._stepper_items = {}
         self._game_icons = {}
         self._app_icon = None
         self._build_widgets()
@@ -189,7 +541,7 @@ class DailyGamesApp:
     # ------------------------------------------------------------------
 
     def _configure_styles(self):
-        """配置一套不依赖第三方主题的深色 ttk 样式。"""
+        """配置一套不依赖第三方主题的深色 ttk 样式（仅保留 ttk 残留控件）。"""
         style = ttk.Style(self.root)
         if "clam" in style.theme_names():
             style.theme_use("clam")
@@ -256,52 +608,6 @@ class DailyGamesApp:
             background=[("active", COLORS["surface"])],
             foreground=[("disabled", COLORS["text_subtle"])],
         )
-
-        self._configure_button_style(
-            style,
-            "Primary.TButton",
-            COLORS["primary"],
-            "#08111F",
-            COLORS["primary_hover"],
-            COLORS["primary_pressed"],
-            padding=(20, 13),
-        )
-        self._configure_button_style(
-            style,
-            "Secondary.TButton",
-            COLORS["surface_alt"],
-            COLORS["text"],
-            COLORS["surface_hover"],
-            COLORS["border"],
-            padding=(14, 10),
-        )
-        self._configure_button_style(
-            style,
-            "Danger.TButton",
-            "#3A2028",
-            "#FFB6B6",
-            "#502A34",
-            "#281820",
-            padding=(14, 10),
-        )
-        self._configure_button_style(
-            style,
-            "CardAction.TButton",
-            COLORS["surface_alt"],
-            COLORS["text_muted"],
-            COLORS["surface_hover"],
-            COLORS["border"],
-            padding=(12, 9),
-        )
-        self._configure_button_style(
-            style,
-            "Tool.TButton",
-            COLORS["background"],
-            COLORS["text_muted"],
-            COLORS["surface_alt"],
-            COLORS["border_soft"],
-            padding=(12, 8),
-        )
         style.layout(
             "Minimal.Vertical.TScrollbar",
             [
@@ -334,30 +640,6 @@ class DailyGamesApp:
             background=[("active", COLORS["surface_hover"])],
         )
 
-    @staticmethod
-    def _configure_button_style(style, name, background, foreground,
-                                active, pressed, *, padding):
-        style.configure(
-            name,
-            background=background,
-            foreground=foreground,
-            borderwidth=0,
-            relief=tk.FLAT,
-            padding=padding,
-            font=("Microsoft YaHei UI", 10, "bold"),
-            focuscolor=COLORS["primary"],
-        )
-        style.map(
-            name,
-            background=[
-                ("disabled", COLORS["border_soft"]),
-                ("pressed", pressed),
-                ("active", active),
-            ],
-            foreground=[("disabled", COLORS["disabled"])],
-            relief=[("pressed", tk.FLAT)],
-        )
-
     def _load_game_icons(self):
         try:
             self._app_icon = tk.PhotoImage(
@@ -379,7 +661,7 @@ class DailyGamesApp:
                 self._game_icons[game_id] = None
 
     def _place_initial_window(self):
-        width, height = 1120, 780
+        width, height = 1240, 860
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
         x = max(0, (screen_width - width) // 2)
@@ -419,186 +701,154 @@ class DailyGamesApp:
         shell = tk.Frame(self.root, background=COLORS["background"])
         shell.pack(fill=tk.BOTH, expand=True)
 
-        header = tk.Frame(shell, background=COLORS["background"])
-        header.pack(fill=tk.X, padx=26, pady=(20, 14))
+        self._build_sidebar(shell)
 
-        brand = tk.Canvas(
-            header, width=48, height=48, background=COLORS["background"],
-            highlightthickness=0,
-        )
-        brand.pack(side=tk.LEFT, padx=(0, 13))
-        brand.create_rectangle(2, 2, 46, 46, fill=COLORS["surface_alt"],
-                               outline=COLORS["border"], width=1)
-        brand.create_rectangle(2, 2, 7, 46, fill=COLORS["primary"],
-                               outline="")
-        brand.create_text(
-            27, 24, text="DG", fill=COLORS["text"],
-            font=("Segoe UI", 13, "bold"),
-        )
+        content_bg = COLORS["content_background"]
+        main = tk.Frame(shell, background=content_bg)
+        main.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        title_block = tk.Frame(header, background=COLORS["background"])
+        header = tk.Frame(main, background=content_bg)
+        header.pack(fill=tk.X, padx=28, pady=(24, 18))
+
+        title_block = tk.Frame(header, background=content_bg)
         title_block.pack(side=tk.LEFT)
         tk.Label(
-            title_block, text="一键日常", background=COLORS["background"],
+            title_block, text="今日队列", background=content_bg,
             foreground=COLORS["text"],
-            font=("Microsoft YaHei UI", 21, "bold"),
+            font=("Microsoft YaHei UI", 18, "bold"),
         ).pack(anchor=tk.W)
         tk.Label(
-            title_block, text="DAILY OPS  ·  三款游戏顺序执行与自动收尾",
-            background=COLORS["background"], foreground=COLORS["text_subtle"],
-            font=("Segoe UI", 9),
-        ).pack(anchor=tk.W, pady=(2, 0))
+            title_block, text="按顺序执行 · 异常时暂停等待处理",
+            background=content_bg, foreground=COLORS["text_subtle"],
+            font=("Microsoft YaHei UI", 9),
+        ).pack(anchor=tk.W, pady=(4, 0))
 
         self.overall_var = tk.StringVar(value="总状态：待命")
         self.current_var = tk.StringVar(value="当前游戏：—")
-        status_panel = tk.Frame(
-            header, background=COLORS["surface"], highlightthickness=1,
-            highlightbackground=COLORS["border_soft"], padx=14, pady=9,
+        status_panel = RoundedPanel(
+            header, radius=12, background=COLORS["surface"],
+            border=COLORS["border_soft"], padding=12,
+            parent_background=content_bg,
         )
         status_panel.pack(side=tk.RIGHT)
-        dot = tk.Canvas(
-            status_panel, width=12, height=12, background=COLORS["surface"],
-            highlightthickness=0,
-        )
-        dot.pack(side=tk.LEFT, padx=(0, 9))
-        self._overall_dot_item = dot.create_oval(
-            2, 2, 10, 10, fill=STATE_COLORS["idle"], outline=""
-        )
-        self._overall_dot_canvas = dot
-        status_text = tk.Frame(status_panel, background=COLORS["surface"])
-        status_text.pack(side=tk.LEFT)
-        self._overall_value_label = tk.Label(
-            status_text, textvariable=self.overall_var,
-            background=COLORS["surface"], foreground=COLORS["text"],
-            font=("Microsoft YaHei UI", 10, "bold"),
-        )
-        self._overall_value_label.pack(anchor=tk.W)
+        status_inner = status_panel.content
+        caption_row = tk.Frame(status_inner, background=COLORS["surface"])
+        caption_row.pack(fill=tk.X)
         tk.Label(
-            status_text, textvariable=self.current_var,
+            caption_row, text="总状态", background=COLORS["surface"],
+            foreground=COLORS["text_subtle"],
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        self._overall_pill = StatusPill(
+            caption_row, tint_base=COLORS["surface"],
+            parent_background=COLORS["surface"],
+        )
+        self._overall_pill.set(state_label("idle"), STATE_COLORS["idle"])
+        self._overall_pill.pack(side=tk.LEFT)
+        tk.Label(
+            status_inner, textvariable=self.current_var,
             background=COLORS["surface"], foreground=COLORS["text_muted"],
             font=("Microsoft YaHei UI", 9),
-        ).pack(anchor=tk.W, pady=(2, 0))
+        ).pack(anchor=tk.W, pady=(8, 0))
+        status_panel.fit()
 
-        content = tk.Frame(shell, background=COLORS["background"])
-        content.pack(fill=tk.BOTH, expand=True, padx=26, pady=(0, 22))
-
-        queue_header = tk.Frame(content, background=COLORS["background"])
-        queue_header.pack(fill=tk.X, pady=(0, 9))
+        hero = RoundedPanel(
+            main, radius=16, background=COLORS["surface"],
+            border=COLORS["border_soft"], padding=18,
+            parent_background=content_bg, decorate=self._decorate_hero,
+        )
+        hero.pack(fill=tk.X, padx=28)
+        hero_inner = hero.content
+        hero_copy = tk.Frame(hero_inner, background=COLORS["surface"])
+        hero_copy.pack(side=tk.LEFT, padx=(0, 20))
         tk.Label(
-            queue_header, text="今日队列", background=COLORS["background"],
+            hero_copy, text="完整队列", background=COLORS["surface"],
             foreground=COLORS["text"],
             font=("Microsoft YaHei UI", 13, "bold"),
-        ).pack(side=tk.LEFT)
+        ).pack(anchor=tk.W)
         tk.Label(
-            queue_header, text="  按顺序执行 · 异常时暂停等待处理",
-            background=COLORS["background"], foreground=COLORS["text_subtle"],
+            hero_copy, text="依次完成三款游戏日常",
+            background=COLORS["surface"], foreground=COLORS["text_subtle"],
             font=("Microsoft YaHei UI", 9),
-        ).pack(side=tk.LEFT, pady=(3, 0))
-        tk.Label(
-            queue_header, text="01  →  02  →  03",
-            background=COLORS["background"], foreground=COLORS["text_subtle"],
-            font=("Cascadia Mono", 9, "bold"),
-        ).pack(side=tk.RIGHT, pady=(3, 0))
+        ).pack(anchor=tk.W, pady=(4, 0))
 
-        cards_frame = tk.Frame(content, background=COLORS["background"])
-        cards_frame.pack(fill=tk.X)
+        hero_controls = tk.Frame(hero_inner, background=COLORS["surface"])
+        hero_controls.pack(side=tk.RIGHT)
+        self.btn_retry = FlatButton(
+            hero_controls, "重试当前", self.controller.retry_current,
+            variant="secondary", padx=14,
+        )
+        self.btn_skip = FlatButton(
+            hero_controls, "跳过当前", self.controller.skip_current,
+            variant="secondary", padx=14,
+        )
+        self.btn_stop = FlatButton(
+            hero_controls, "安全停止", self._on_stop, variant="danger",
+            padx=14,
+        )
+        self.btn_start_all = FlatButton(
+            hero_controls, "开始全部日常  ▶", self._on_start_all,
+            variant="primary", height=46, padx=22,
+            font=("Microsoft YaHei UI", 11, "bold"),
+        )
+        for btn in (self.btn_retry, self.btn_skip, self.btn_stop):
+            btn.pack(side=tk.LEFT, padx=(0, 10))
+        self.btn_start_all.pack(side=tk.LEFT)
+        hero.fit()
+
+        cards_frame = tk.Frame(main, background=content_bg)
+        cards_frame.pack(fill=tk.X, padx=28, pady=(14, 0))
         self.btn_run_one = {}
         for col, game_id in enumerate(GAME_ORDER):
             cards_frame.columnconfigure(col, weight=1, uniform="game-cards")
             self._build_card(cards_frame, game_id, col)
 
-        action_panel = tk.Frame(
-            content, background=COLORS["surface"], highlightthickness=1,
-            highlightbackground=COLORS["border_soft"], padx=18, pady=14,
+        log_bg = COLORS["log_background"]
+        log_panel = RoundedPanel(
+            main, radius=16, background=log_bg,
+            border=COLORS["border_soft"], padding=0,
+            parent_background=content_bg,
         )
-        action_panel.pack(fill=tk.X, pady=(14, 10))
-        tk.Frame(action_panel, background=COLORS["primary"], width=3).pack(
-            side=tk.LEFT, fill=tk.Y, padx=(0, 15)
+        log_panel.pack(fill=tk.BOTH, expand=True, padx=28, pady=(16, 24))
+        log_inner = log_panel.content
+        log_header = tk.Frame(log_inner, background=log_bg)
+        log_header.pack(fill=tk.X, padx=16, pady=(12, 8))
+        dots = tk.Canvas(
+            log_header, width=42, height=12, background=log_bg,
+            highlightthickness=0, bd=0,
         )
-        action_copy = tk.Frame(action_panel, background=COLORS["surface"])
-        action_copy.pack(side=tk.LEFT, padx=(0, 18))
+        dots.pack(side=tk.LEFT, padx=(0, 10))
+        for index, tone in enumerate(
+            (COLORS["danger"], COLORS["warning"], COLORS["success"])
+        ):
+            dots.create_oval(
+                2 + index * 14, 3, 10 + index * 14, 11,
+                fill=_hex_mix(tone, log_bg, 0.55), outline="",
+            )
         tk.Label(
-            action_copy, text="完整队列", background=COLORS["surface"],
-            foreground=COLORS["text"],
-            font=("Microsoft YaHei UI", 11, "bold"),
-        ).pack(anchor=tk.W)
-        tk.Label(
-            action_copy, text="依次完成三款游戏日常",
-            background=COLORS["surface"], foreground=COLORS["text_subtle"],
-            font=("Microsoft YaHei UI", 9),
-        ).pack(anchor=tk.W, pady=(2, 0))
-        self.btn_start_all = ttk.Button(
-            action_panel, text="开始全部日常  ▶", style="Primary.TButton",
-            command=self._on_start_all,
-        )
-        self.btn_start_all.pack(side=tk.LEFT)
-
-        controls = tk.Frame(action_panel, background=COLORS["surface"])
-        controls.pack(side=tk.RIGHT)
-        self.btn_retry = ttk.Button(
-            controls, text="重试当前", style="Secondary.TButton",
-            command=self.controller.retry_current,
-        )
-        self.btn_skip = ttk.Button(
-            controls, text="跳过当前", style="Secondary.TButton",
-            command=self.controller.skip_current,
-        )
-        self.btn_stop = ttk.Button(
-            controls, text="安全停止", style="Danger.TButton", command=self._on_stop
-        )
-        for btn in (self.btn_retry, self.btn_skip, self.btn_stop):
-            btn.pack(side=tk.LEFT, padx=(8, 0))
-
-        tool_frame = tk.Frame(content, background=COLORS["background"])
-        tool_frame.pack(fill=tk.X, pady=(0, 10))
-        tk.Label(
-            tool_frame, text="维护工具", background=COLORS["background"],
-            foreground=COLORS["text_subtle"],
-            font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        self.btn_check = ttk.Button(
-            tool_frame, text="检查软件地址与配置", style="Tool.TButton",
-            command=self._on_check_config,
-        )
-        self.btn_restore = ttk.Button(
-            tool_frame, text="恢复配置备份", style="Tool.TButton",
-            command=self._on_restore_backup,
-        )
-        self.btn_check.pack(side=tk.LEFT)
-        self.btn_restore.pack(side=tk.LEFT, padx=(8, 0))
-        tk.Label(
-            tool_frame, text="执行期间配置工具会自动锁定",
-            background=COLORS["background"], foreground=COLORS["text_subtle"],
-            font=("Microsoft YaHei UI", 9),
-        ).pack(side=tk.RIGHT)
-
-        log_frame = tk.Frame(
-            content, background=COLORS["surface"], highlightthickness=1,
-            highlightbackground=COLORS["border_soft"],
-        )
-        log_frame.pack(fill=tk.BOTH, expand=True)
-        log_header = tk.Frame(log_frame, background=COLORS["surface"])
-        log_header.pack(fill=tk.X, padx=14, pady=(10, 8))
-        tk.Label(
-            log_header, text="事件记录", background=COLORS["surface"],
+            log_header, text="事件记录", background=log_bg,
             foreground=COLORS["text"],
             font=("Microsoft YaHei UI", 11, "bold"),
         ).pack(side=tk.LEFT)
-        tk.Label(
-            log_header, text="  LIVE", background=COLORS["surface"],
-            foreground=COLORS["success"], font=("Cascadia Mono", 8, "bold"),
-        ).pack(side=tk.LEFT, pady=(3, 0))
-        self.btn_logs = ttk.Button(
-            log_header, text="打开日志目录", style="Tool.TButton",
-            command=self._on_open_logs,
+        live_pill = StatusPill(
+            log_header, tint_base=log_bg,
+            parent_background=log_bg,
+            font=("Cascadia Mono", 8, "bold"), height=20, padx=10,
+        )
+        live_pill.set("LIVE", COLORS["success"])
+        live_pill.pack(side=tk.LEFT, padx=(10, 0))
+        self.btn_logs = FlatButton(
+            log_header, "打开日志目录", self._on_open_logs,
+            variant="ghost", parent_background=log_bg,
+            height=30, padx=12, font=("Microsoft YaHei UI", 9, "bold"),
         )
         self.btn_logs.pack(side=tk.RIGHT)
 
-        log_body = tk.Frame(log_frame, background=COLORS["log_background"])
-        log_body.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+        log_body = tk.Frame(log_inner, background=log_bg)
+        log_body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 10))
         self.log_text = tk.Text(
             log_body, height=8, wrap=tk.WORD, state=tk.DISABLED,
-            background=COLORS["log_background"], foreground=COLORS["text_muted"],
+            background=log_bg, foreground=COLORS["text_muted"],
             insertbackground=COLORS["text"], selectbackground="#28466E",
             selectforeground=COLORS["text"], relief=tk.FLAT, borderwidth=0,
             highlightthickness=0, padx=12, pady=10,
@@ -615,21 +865,164 @@ class DailyGamesApp:
         self.log_text.configure(yscrollcommand=scrollbar.set)
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        log_panel.fit()
+
+    @staticmethod
+    def _decorate_hero(canvas, width, height):
+        """主操作带的柔和光晕；全部位于圆角区域内部，避免压到边角。"""
+        glow = _hex_mix(COLORS["primary"], COLORS["surface"], 0.94)
+        canvas.create_oval(
+            width - 400, height // 2 - 80, width - 80, height // 2 + 80,
+            fill=glow, outline="", tags="panel",
+        )
+
+    def _build_sidebar(self, shell):
+        sidebar = tk.Frame(shell, background=COLORS["background"], width=252)
+        sidebar.pack(side=tk.LEFT, fill=tk.Y)
+        sidebar.pack_propagate(False)
+
+        brand = tk.Frame(sidebar, background=COLORS["background"])
+        brand.pack(fill=tk.X, padx=22, pady=(26, 0))
+        if self._app_icon is not None:
+            self._brand_icon = self._app_icon.subsample(2, 2)
+            tk.Label(
+                brand, image=self._brand_icon,
+                background=COLORS["background"], borderwidth=0,
+            ).pack(side=tk.LEFT, padx=(0, 12))
+        else:
+            fallback = tk.Canvas(
+                brand, width=32, height=32, background=COLORS["background"],
+                highlightthickness=0,
+            )
+            fallback.pack(side=tk.LEFT, padx=(0, 12))
+            _rounded_rect(
+                fallback, 1, 1, 30, 30, 8, fill=COLORS["surface_alt"],
+                outline=COLORS["border"], width=1,
+            )
+            fallback.create_text(
+                16, 16, text="DG", fill=COLORS["primary"],
+                font=("Segoe UI", 10, "bold"),
+            )
+        brand_text = tk.Frame(brand, background=COLORS["background"])
+        brand_text.pack(side=tk.LEFT)
+        tk.Label(
+            brand_text, text="一键日常", background=COLORS["background"],
+            foreground=COLORS["text"],
+            font=("Microsoft YaHei UI", 15, "bold"),
+        ).pack(anchor=tk.W)
+        tk.Label(
+            brand_text, text="DAILY OPS", background=COLORS["background"],
+            foreground=COLORS["text_subtle"], font=("Segoe UI", 8),
+        ).pack(anchor=tk.W, pady=(3, 0))
+
+        tk.Frame(sidebar, height=1, background=COLORS["border_soft"]).pack(
+            fill=tk.X, padx=22, pady=(20, 14)
+        )
+
+        self._build_stepper(sidebar)
+
+        tk.Frame(sidebar, background=COLORS["background"]).pack(
+            fill=tk.BOTH, expand=True
+        )
+
+        tk.Frame(sidebar, height=1, background=COLORS["border_soft"]).pack(
+            fill=tk.X, padx=22, pady=(0, 12)
+        )
+        tools = tk.Frame(sidebar, background=COLORS["background"])
+        tools.pack(fill=tk.X, padx=22, pady=(0, 22))
+        tk.Label(
+            tools, text="维护工具", background=COLORS["background"],
+            foreground=COLORS["text_subtle"],
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).pack(anchor=tk.W)
+        self.btn_check = FlatButton(
+            tools, "检查软件地址与配置", self._on_check_config,
+            variant="ghost", height=34,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        self.btn_restore = FlatButton(
+            tools, "恢复配置备份", self._on_restore_backup,
+            variant="ghost", height=34,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        self.btn_check.pack(fill=tk.X, pady=(10, 0))
+        self.btn_restore.pack(fill=tk.X, pady=(6, 0))
+        tk.Label(
+            tools, text="执行期间配置工具自动锁定",
+            background=COLORS["background"], foreground=COLORS["text_subtle"],
+            font=("Microsoft YaHei UI", 8),
+        ).pack(anchor=tk.W, pady=(10, 0))
+
+    def _build_stepper(self, sidebar):
+        caption_row = tk.Frame(sidebar, background=COLORS["background"])
+        caption_row.pack(fill=tk.X, padx=22)
+        tk.Label(
+            caption_row, text="执行队列", background=COLORS["background"],
+            foreground=COLORS["text_subtle"],
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            caption_row, text="QUEUE", background=COLORS["background"],
+            foreground=COLORS["text_subtle"],
+            font=("Cascadia Mono", 7, "bold"),
+        ).pack(side=tk.RIGHT, pady=(2, 0))
+
+        self._stepper_icons = {}
+        self._stepper_items = {}
+        row_height = 62
+        canvas = tk.Canvas(
+            sidebar, width=208, height=row_height * len(GAME_ORDER) + 4,
+            background=COLORS["background"], highlightthickness=0, bd=0,
+        )
+        canvas.pack(padx=22, pady=(8, 0), anchor=tk.W)
+        centers = [
+            row_height * index + row_height // 2
+            for index in range(len(GAME_ORDER))
+        ]
+        canvas.create_line(
+            16, centers[0], 16, centers[-1], fill=COLORS["border"], width=2,
+        )
+        for index, game_id in enumerate(GAME_ORDER):
+            y = centers[index]
+            dot = canvas.create_oval(
+                9, y - 7, 23, y + 7,
+                fill=STATE_COLORS["idle"],
+                outline=COLORS["background"], width=3,
+            )
+            text_x = 40
+            source_icon = self._game_icons.get(game_id)
+            if source_icon is not None:
+                icon = source_icon.subsample(2, 2)
+                self._stepper_icons[game_id] = icon
+                canvas.create_image(52, y, image=icon)
+                text_x = 74
+            canvas.create_text(
+                text_x, y - 10, anchor="w",
+                text=GAME_APPEARANCE[game_id]["short_name"],
+                fill=COLORS["text"],
+                font=("Microsoft YaHei UI", 10, "bold"),
+            )
+            state_item = canvas.create_text(
+                text_x, y + 11, anchor="w", text=state_label("idle"),
+                fill=STATE_COLORS["idle"], font=("Microsoft YaHei UI", 9),
+            )
+            self._stepper_items[game_id] = (dot, state_item)
+        self._stepper_canvas = canvas
+
 
     def _build_card(self, parent, game_id, column):
         meta = GAME_APPEARANCE[game_id]
-        left_pad = 0 if column == 0 else 6
-        right_pad = 0 if column == len(GAME_ORDER) - 1 else 6
-        frame = tk.Frame(
-            parent, background=COLORS["surface"], highlightthickness=1,
-            highlightbackground=COLORS["border"],
+        left_pad = 0 if column == 0 else 7
+        right_pad = 0 if column == len(GAME_ORDER) - 1 else 7
+        panel = RoundedPanel(
+            parent, radius=14, background=COLORS["surface"],
+            border=COLORS["border"], padding=16,
+            parent_background=COLORS["content_background"],
         )
-        frame.grid(
+        panel.grid(
             row=0, column=column, sticky="nsew", padx=(left_pad, right_pad)
         )
-        tk.Frame(frame, height=3, background=meta["accent"]).pack(fill=tk.X)
-        body = tk.Frame(frame, background=COLORS["surface"], padx=15, pady=13)
-        body.pack(fill=tk.BOTH, expand=True)
+        body = panel.content
 
         top = tk.Frame(body, background=COLORS["surface"])
         top.pack(fill=tk.X)
@@ -637,15 +1030,15 @@ class DailyGamesApp:
         if icon is not None:
             tk.Label(
                 top, image=icon, background=COLORS["surface"], borderwidth=0,
-            ).pack(side=tk.LEFT, padx=(0, 11))
+            ).pack(side=tk.LEFT, padx=(0, 12))
         else:
             fallback = tk.Canvas(
                 top, width=48, height=48, background=COLORS["surface"],
                 highlightthickness=0,
             )
-            fallback.pack(side=tk.LEFT, padx=(0, 11))
-            fallback.create_rectangle(
-                1, 1, 47, 47, fill=COLORS["surface_alt"],
+            fallback.pack(side=tk.LEFT, padx=(0, 12))
+            _rounded_rect(
+                fallback, 1, 1, 46, 46, 10, fill=COLORS["surface_alt"],
                 outline=meta["accent"], width=1,
             )
             fallback.create_text(
@@ -658,82 +1051,74 @@ class DailyGamesApp:
         tk.Label(
             name_block, text=GAME_NAMES[game_id], background=COLORS["surface"],
             foreground=COLORS["text"], anchor=tk.W,
-            font=("Microsoft YaHei UI", 11, "bold"),
+            font=("Microsoft YaHei UI", 12, "bold"),
         ).pack(fill=tk.X)
         tk.Label(
             name_block,
             text=f"{meta['latin_name']}  ·  {meta['helper']}",
             background=COLORS["surface"], foreground=COLORS["text_subtle"],
             anchor=tk.W, font=("Segoe UI", 8, "bold"),
-        ).pack(fill=tk.X, pady=(3, 0))
+        ).pack(fill=tk.X, pady=(4, 0))
         tk.Label(
             top, text=meta["index"], background=COLORS["surface"],
             foreground=meta["accent"], font=("Cascadia Mono", 10, "bold"),
         ).pack(side=tk.RIGHT, anchor=tk.N)
 
         tk.Frame(body, height=1, background=COLORS["border_soft"]).pack(
-            fill=tk.X, pady=(12, 10)
+            fill=tk.X, pady=(14, 12)
         )
-        state_var = tk.StringVar(value=f"阶段：{state_label('idle')}")
         msg_var = tk.StringVar(value="最近讯息：—")
         err_var = tk.StringVar(value="")
 
-        state_row = tk.Frame(body, background=COLORS["surface"])
-        state_row.pack(fill=tk.X)
-        state_dot = tk.Canvas(
-            state_row, width=12, height=12, background=COLORS["surface"],
-            highlightthickness=0,
+        pill = StatusPill(
+            body, tint_base=COLORS["surface"],
+            parent_background=COLORS["surface"],
         )
-        state_dot.pack(side=tk.LEFT, padx=(0, 7))
-        dot_item = state_dot.create_oval(
-            2, 2, 10, 10, fill=STATE_COLORS["idle"], outline=""
-        )
-        state_label_widget = tk.Label(
-            state_row, textvariable=state_var, background=COLORS["surface"],
-            foreground=STATE_COLORS["idle"], anchor=tk.W,
-            font=("Microsoft YaHei UI", 11, "bold"),
-        )
-        state_label_widget.pack(side=tk.LEFT)
+        pill.set(state_label("idle"), STATE_COLORS["idle"])
+        pill.pack(anchor=tk.W)
+
         tk.Label(
-            body, textvariable=msg_var, wraplength=280, justify=tk.LEFT,
+            body, textvariable=msg_var, wraplength=290, justify=tk.LEFT,
             anchor=tk.W, background=COLORS["surface"],
             foreground=COLORS["text_muted"], height=2,
             font=("Microsoft YaHei UI", 9),
-        ).pack(fill=tk.X, pady=(7, 0))
-        err_label = tk.Label(
-            body, textvariable=err_var, wraplength=280, justify=tk.LEFT,
+        ).pack(fill=tk.X, pady=(11, 0))
+        tk.Label(
+            body, textvariable=err_var, wraplength=290, justify=tk.LEFT,
             anchor=tk.W, background=COLORS["surface"],
             foreground=COLORS["danger"], height=1,
             font=("Cascadia Mono", 8, "bold"),
-        )
-        err_label.pack(fill=tk.X, pady=(2, 7))
-        btn = ttk.Button(
-            body, text="仅运行此游戏", style="CardAction.TButton",
-            command=lambda gid=game_id: self._on_run_one(gid),
+        ).pack(fill=tk.X, pady=(3, 10))
+        btn = FlatButton(
+            body, "仅运行此游戏",
+            lambda gid=game_id: self._on_run_one(gid),
+            variant="card", parent_background=COLORS["surface"],
+            height=36, font=("Microsoft YaHei UI", 9, "bold"),
         )
         btn.pack(fill=tk.X)
 
-        self._card_frames[game_id] = frame
-        self._card_state_labels[game_id] = state_label_widget
-        self._card_state_dots[game_id] = (state_dot, dot_item)
-        self._card_state_vars[game_id] = state_var
+        self._card_frames[game_id] = panel
+        self._card_state_pills[game_id] = pill
         self._card_msg_vars[game_id] = msg_var
         self._card_err_vars[game_id] = err_var
         self.btn_run_one[game_id] = btn
+        panel.fit()
 
     def _set_card_state_visual(self, game_id, state):
         color = STATE_COLORS.get(state, COLORS["text_muted"])
-        label = self._card_state_labels.get(game_id)
-        if label is not None:
-            label.configure(foreground=color)
-        dot = self._card_state_dots.get(game_id)
-        if dot is not None:
-            canvas, item = dot
-            canvas.itemconfigure(item, fill=color)
-        frame = self._card_frames.get(game_id)
-        if frame is not None:
-            border = color if state != "idle" else COLORS["border"]
-            frame.configure(highlightbackground=border)
+        pill = self._card_state_pills.get(game_id)
+        if pill is not None:
+            pill.set(state_label(state), color)
+        panel = self._card_frames.get(game_id)
+        if panel is not None:
+            panel.set_border(color if state != "idle" else COLORS["border"])
+        stepper_item = self._stepper_items.get(game_id)
+        if stepper_item is not None:
+            dot_item, state_item = stepper_item
+            self._stepper_canvas.itemconfigure(dot_item, fill=color)
+            self._stepper_canvas.itemconfigure(
+                state_item, text=state_label(state), fill=color
+            )
 
     # ------------------------------------------------------------------
     # 事件回圈（主线程）
@@ -759,9 +1144,6 @@ class DailyGamesApp:
         self.controller.apply_event(event)
         card = self.controller.cards.get(event.game_id)
         if card is not None:
-            self._card_state_vars[event.game_id].set(
-                f"阶段：{state_label(card.state)}"
-            )
             self._card_msg_vars[event.game_id].set(
                 f"最近讯息：{card.message or '—'}"
             )
@@ -796,12 +1178,12 @@ class DailyGamesApp:
         except Exception as exc:  # noqa: BLE001 - 状态列不能让回调静默失败
             self._append_log(f"读取编排器状态失败：{exc!r}")
             return
-        self.overall_var.set(f"总状态：{state_label(current_state)}")
+        state_text = state_label(current_state)
+        self.overall_var.set(f"总状态：{state_text}")
         name = GAME_NAMES.get(current_game, current_game) if current_game else "—"
         self.current_var.set(f"当前游戏：{name}")
         color = STATE_COLORS.get(current_state, COLORS["text_muted"])
-        self._overall_dot_canvas.itemconfigure(self._overall_dot_item, fill=color)
-        self._overall_value_label.configure(foreground=color)
+        self._overall_pill.set(state_text, color)
 
     def _refresh_controls(self):
         try:
@@ -1020,18 +1402,18 @@ class DailyGamesApp:
 
         dialog.protocol("WM_DELETE_WINDOW", choose_cancel)
 
-        ttk.Button(
-            buttons, text="保留游戏与挂机程序，仅退出界面",
-            style="Secondary.TButton", command=choose_keep,
-        ).pack(fill=tk.X, pady=2)
-        ttk.Button(
-            buttons, text="安全停止队列后退出", style="Danger.TButton",
-            command=choose_stop,
-        ).pack(fill=tk.X, pady=2)
-        ttk.Button(
-            buttons, text="取消，返回主窗口", style="Primary.TButton",
-            command=choose_cancel,
-        ).pack(fill=tk.X, pady=2)
+        FlatButton(
+            buttons, "保留游戏与挂机程序，仅退出界面", choose_keep,
+            variant="secondary",
+        ).pack(fill=tk.X, pady=3)
+        FlatButton(
+            buttons, "安全停止队列后退出", choose_stop,
+            variant="danger",
+        ).pack(fill=tk.X, pady=3)
+        FlatButton(
+            buttons, "取消，返回主窗口", choose_cancel,
+            variant="primary",
+        ).pack(fill=tk.X, pady=3)
 
         dialog.grab_set()
 
@@ -1150,24 +1532,15 @@ class DailyGamesApp:
 
         actions = ttk.Frame(wizard, padding=12)
         actions.pack(fill=tk.X)
-        ttk.Button(
-            actions, text="加载建议变更", style="Secondary.TButton",
-            command=load_changes,
-        ).pack(
-            side=tk.LEFT
-        )
-        ttk.Button(
-            actions, text="应用勾选的变更", style="Primary.TButton",
-            command=apply,
-        ).pack(
-            side=tk.LEFT, padx=8
-        )
-        ttk.Button(
-            actions, text="关闭", style="Secondary.TButton",
-            command=wizard.destroy,
-        ).pack(
-            side=tk.RIGHT
-        )
+        FlatButton(
+            actions, "加载建议变更", load_changes, variant="secondary",
+        ).pack(side=tk.LEFT)
+        FlatButton(
+            actions, "应用勾选的变更", apply, variant="primary",
+        ).pack(side=tk.LEFT, padx=8)
+        FlatButton(
+            actions, "关闭", wizard.destroy, variant="secondary",
+        ).pack(side=tk.RIGHT)
 
         load_changes()
 
@@ -1234,18 +1607,12 @@ class DailyGamesApp:
                 on_done=self._show_check_results,
             )
 
-        ttk.Button(
-            actions, text="恢复所选备份", style="Danger.TButton",
-            command=restore,
-        ).pack(
-            side=tk.LEFT
-        )
-        ttk.Button(
-            actions, text="取消", style="Secondary.TButton",
-            command=dialog.destroy,
-        ).pack(
-            side=tk.RIGHT
-        )
+        FlatButton(
+            actions, "恢复所选备份", restore, variant="danger",
+        ).pack(side=tk.LEFT)
+        FlatButton(
+            actions, "取消", dialog.destroy, variant="secondary",
+        ).pack(side=tk.RIGHT)
 
     def _show_text_dialog(self, title, content):
         dialog = tk.Toplevel(self.root)
@@ -1263,8 +1630,8 @@ class DailyGamesApp:
                   pady=12)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 12), pady=12)
         self._set_text(text, content)
-        ttk.Button(
-            dialog, text="关闭", style="Primary.TButton", command=dialog.destroy,
+        FlatButton(
+            dialog, "关闭", dialog.destroy, variant="primary",
         ).pack(pady=(0, 12))
 
     @staticmethod

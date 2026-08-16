@@ -47,7 +47,7 @@ def _write_launcher_worker(
     target_executable: str = r"C:\Games\Arknights.exe",
 ) -> tuple[Path, str]:
     metadata = {
-        "version": 4,
+        "version": 5,
         "launcher_executable": launcher,
         "working_directory": cwd,
         "arguments": arguments,
@@ -60,7 +60,7 @@ def _write_launcher_worker(
         )
     ).decode("ascii")
     source = (
-        f"# DAILY_GAMES_LAUNCHER_WORKER_V4={marker}\r\n"
+        f"# DAILY_GAMES_LAUNCHER_WORKER_V5={marker}\r\n"
         "$ErrorActionPreference = 'SilentlyContinue'\r\n"
     )
     worker_path = directory / "launcher_automation_Arknights.ps1"
@@ -82,7 +82,7 @@ def _write_launcher_worker(
 
 
 class TestLauncherWorkerSecurityContract(unittest.TestCase):
-    def test_contract_uses_protected_root_and_v4_metadata(self):
+    def test_contract_uses_protected_root_and_v5_metadata(self):
         with tempfile.TemporaryDirectory() as td:
             worker_root = Path(td) / "DailyGames" / "workers"
             worker_root.mkdir(parents=True)
@@ -108,7 +108,7 @@ class TestLauncherWorkerSecurityContract(unittest.TestCase):
             metadata = process_monitor_module._read_launcher_worker_metadata(
                 worker_path
             )
-            self.assertEqual(metadata["version"], 4)
+            self.assertEqual(metadata["version"], 5)
             self.assertEqual(
                 metadata["target_executable"],
                 r"C:\Games\Arknights.exe",
@@ -137,12 +137,12 @@ class TestLauncherWorkerSecurityContract(unittest.TestCase):
 
             self.assertIsNone(contract)
 
-    def test_v3_worker_metadata_is_rejected(self):
+    def test_v4_worker_metadata_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             worker_path, _ = _write_launcher_worker(Path(td))
             source = worker_path.read_text(encoding="utf-8-sig").replace(
+                "DAILY_GAMES_LAUNCHER_WORKER_V5",
                 "DAILY_GAMES_LAUNCHER_WORKER_V4",
-                "DAILY_GAMES_LAUNCHER_WORKER_V3",
             )
             worker_path.write_text(source, encoding="utf-8-sig")
 

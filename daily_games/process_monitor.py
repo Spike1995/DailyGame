@@ -428,13 +428,45 @@ class ProcessMonitor:
 
     所有 wait_* 方法接受 ``stop_event``（threading.Event 或具 ``is_set()`` 的对象）
     与 ``timeout_s``，轮询间隔默认 1 秒。不可永久阻塞。
+
+    为避免轮询循环里多次 ``find_by_executable`` 各做一次完整 ToolHelp32 扫描，
+    本类缓存最近一次系统进程快照，TTL 默认 50ms（小于最小轮询间隔）。
+    ``launch`` / ``terminate_if_owned`` 等改变进程状态的操作会让缓存立即失效。
     """
+
+    # 进程快照缓存 TTL。适配器在单次 wait_completion 循环里可能调用 6-7 次
+    # find_by_executable；缓存让它们共享同一份系统快照，把每轮系统调用数
+    # 从几十次降到一次。TTL 远小于最小轮询间隔，不会让等待逻辑产生可观察延迟。
+    _SNAPSHOT_CACHE_TTL_S = 0.05
 
     def __init__(self, poll_interval_s: float = 1.0):
         self._poll_interval = max(0.05, float(poll_interval_s))
         self._owned: dict[int, ProcessRecord] = {}
         self._children: dict[int, subprocess.Popen] = {}
         self._lock = threading.Lock()
+        self._snapshot_cache: list[dict[str, object]] | None = None
+        self._snapshot_cache_time: float = 0.0
+        self._snapshot_cache_lock = threading.Lock()
+
+    def _cached_snapshot_processes(self) -> list[dict[str, object]]:
+        """带 TTL 的进程快照；同一次轮询循环内多次调用共享一份系统快照。"""
+        now = time.monotonic()
+        with self._snapshot_cache_lock:
+            if (
+                self._snapshot_cache is not None
+                and now - self._snapshot_cache_time < self._SNAPSHOT_CACHE_TTL_S
+            ):
+                return self._snapshot_cache
+        fresh = _snapshot_processes()
+        with self._snapshot_cache_lock:
+            self._snapshot_cache = fresh
+            self._snapshot_cache_time = now
+        return fresh
+
+    def _invalidate_snapshot_cache(self) -> None:
+        """本进程刚启动或终止了进程，让下一次查找重新枚举。"""
+        with self._snapshot_cache_lock:
+            self._snapshot_cache = None
 
     # ------------------------------------------------------------------ #
     # 查找现有进程                                                    #
@@ -470,7 +502,7 @@ class ProcessMonitor:
                 seen_pids.add(pid)
 
         # 再从系统快照补充现有（非 owned）者
-        for p in _snapshot_processes():
+        for p in self._cached_snapshot_processes():
             pid = int(p["pid"])
             exe = str(p["exe"])
             path = str(p["path"])
@@ -544,6 +576,7 @@ class ProcessMonitor:
         with self._lock:
             self._owned[pid] = rec
             self._children[pid] = proc
+        self._invalidate_snapshot_cache()
         return rec
 
     def scheduled_task_matches(
@@ -562,7 +595,8 @@ class ProcessMonitor:
         只有一个系统 Windows PowerShell 短 ``-File`` 动作；包装脚本必须位于
         受保护的 ProgramData 目录，且路径、SHA-256 与版本化元数据必须精确
         匹配启动器、目录、参数和目标游戏进程。
-        旧版双动作或长 ``-EncodedCommand`` 定义都会被拒绝。
+        旧版双动作、长 ``-EncodedCommand`` 定义与 V4 及更早的包装脚本都会
+        被拒绝；仅 V5（点击前窗口就绪门控）受支持。
         """
         if not IS_WINDOWS or not name:
             return False
@@ -653,7 +687,7 @@ class ProcessMonitor:
         if metadata is None:
             return False
         return (
-            metadata.get("version") == 4
+            metadata.get("version") == 5
             and _same_path(str(metadata.get("launcher_executable", "")), executable)
             and _same_path(str(metadata.get("working_directory", "")), cwd)
             and str(metadata.get("arguments", "")).strip() == arguments.strip()
@@ -844,6 +878,7 @@ class ProcessMonitor:
         with self._lock:
             self._owned.pop(pid, None)
             self._children.pop(pid, None)
+        self._invalidate_snapshot_cache()
         return True
 
     def _prune_exited_owned(self) -> None:
@@ -1072,7 +1107,7 @@ def _read_launcher_worker_metadata(
     except (OSError, UnicodeError):
         return None
 
-    marker_prefix = "# DAILY_GAMES_LAUNCHER_WORKER_V4="
+    marker_prefix = "# DAILY_GAMES_LAUNCHER_WORKER_V5="
     markers = [
         line[len(marker_prefix):]
         for line in source.splitlines()

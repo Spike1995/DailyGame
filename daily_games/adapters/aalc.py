@@ -32,13 +32,14 @@ from .base import (
 class AalcAdapter(AdapterBase):
     """边狱巴士 → AALC 适配器。"""
 
-    def __init__(self, *, game_cfg: Mapping[str, object], process_monitor, logger=None):
+    def __init__(self, *, game_cfg: Mapping[str, object], process_monitor, logger=None, global_options=None):
         super().__init__(
             game_id="limbus",
             display_name=str(game_cfg.get("display_name", "边狱巴士")),
             game_cfg=game_cfg,
             process_monitor=process_monitor,
             logger=logger,
+            global_options=global_options,
         )
         self._launch_cfg = game_cfg.get("launch", {}) if isinstance(game_cfg.get("launch"), dict) else {}
         self._helper = game_cfg.get("helper", {}) if isinstance(game_cfg.get("helper"), dict) else {}
@@ -49,6 +50,8 @@ class AalcAdapter(AdapterBase):
         self._scheduled_helper_task_started = False
         self._started_helper_pid: int | None = None
         self._started_game_pid: int | None = None
+        self._baseline_game_pids: set[int] = set()
+        self._owned_game_pids: set[int] = set()
         raw_cli_args = self._helper.get("cli_args", ())
         if isinstance(raw_cli_args, (list, tuple)):
             self._cli_args = tuple(str(value) for value in raw_cli_args)
@@ -153,14 +156,27 @@ class AalcAdapter(AdapterBase):
         )
 
     def start_game(self) -> StepResult:
-        """以 Steam 协议启动；必要时可用可配置的备用方案（直接可执行文件）。"""
+        """以 Steam 协议启动；必要时可用可配置的备用方案（直接可执行文件）。
+
+        启动前先记录基线游戏 PID，``wait_game_ready`` 据此安全接管本轮新出现
+        的 Limbus 进程。Steam 协议无法直接拿到子进程 PID，但接管机制保证
+        AALC 异常退出时 ``--exit 6`` 未关闭的游戏也能在 cleanup 中被收尾，
+        避免残留进程触发下一轮启动屏障死锁。
+        """
+        self._baseline_game_pids = {
+            rec.pid
+            for rec in self._pm.find_by_executable(
+                str(self._game_cfg.get("game_process_name", "LimbusCompany.exe")),
+                expected_path=str(self._game_cfg.get("game_executable", "")),
+            )
+        }
         method = self._launch_cfg.get("method", "steam_protocol")
         if method == "steam_protocol":
             uri = str(self._launch_cfg.get("steam_uri", "steam://run/1973530"))
             # Steam 协议通过 shell 启动，交由 OS 处理（含空格路径安全）
             try:
                 if os.name == "nt":
-                    # 使用 os.starton 最安全，不手工拼接
+                    # 使用 os.startfile 最安全，不手工拼接
                     os.startfile(uri)  # type: ignore[attr-defined]
                     return StepResult(True, CODE_OK, "已通过 Steam 协议启动 Limbus",
                                       {"method": "steam_protocol", "uri": uri})
@@ -203,6 +219,27 @@ class AalcAdapter(AdapterBase):
             return StepResult(False, CODE_STOP_REQUESTED, "等待游戏进程时收到停止要求", {})
         if not recs:
             return StepResult(False, CODE_WAIT_TIMEOUT, f"等待 {name} 超时", {"timeout_s": timeout_s})
+        # 接管本轮新出现的游戏进程，使 cleanup 在 AALC 异常退出时也能收尾
+        # 残留的 Limbus，避免下一轮启动屏障死锁。Fallback 直接启动的 PID
+        # 已在 _launch_fallback 记录，这里补全 Steam 协议路径。
+        take_ownership = getattr(self._pm, "take_ownership", None)
+        if callable(take_ownership):
+            for rec in recs:
+                if rec.pid in self._owned_game_pids or rec.pid == self._started_game_pid:
+                    continue
+                if rec.pid in self._baseline_game_pids:
+                    continue
+                claimed = take_ownership(
+                    rec.pid,
+                    expected_path=game_path,
+                    expected_create_time=(
+                        rec.create_time if rec.create_time > 0.0 else None
+                    ),
+                )
+                if claimed is not None:
+                    self._owned_game_pids.add(rec.pid)
+                    if self._started_game_pid is None:
+                        self._started_game_pid = rec.pid
         return StepResult(True, CODE_OK, f"{name} 已出现", {"pids": [r.pid for r in recs]})
 
     def start_helper(self) -> StepResult:
@@ -229,38 +266,22 @@ class AalcAdapter(AdapterBase):
             return StepResult(False, CODE_ENV_NOT_READY, "AALC.exe 不存在", {})
 
         if bool(self._helper.get("requires_administrator", False)):
-            start_task = getattr(self._pm, "start_scheduled_task", None)
-            if not self._scheduled_helper_task_name or not callable(start_task):
-                return StepResult(
-                    False, CODE_ENV_NOT_READY, "AALC 管理员计划任务不可用", {}
-                )
-            if not start_task(self._scheduled_helper_task_name):
-                return StepResult(
-                    False,
-                    CODE_START_FAILED,
-                    "无法启动 AALC 管理员计划任务",
-                    {"scheduled_task": self._scheduled_helper_task_name},
-                )
-            self._scheduled_helper_task_started = True
             helper_name = str(self._helper.get("process_name", "AALC.exe"))
-            start_timeout = float(
-                self._helper.get("scheduled_task_start_timeout_s", 30.0)
+            outcome = self._launch_helper_via_scheduled_task(
+                task_name=self._scheduled_helper_task_name,
+                helper_name=helper_name,
+                helper_executable=str(exe),
+                start_timeout_s=float(
+                    self._helper.get("scheduled_task_start_timeout_s", 30.0)
+                ),
+                not_ready_message="AALC 管理员计划任务不可用",
+                start_failed_message="无法启动 AALC 管理员计划任务",
+                no_process_message="管理员计划任务已触发，但未发现 AALC 进程",
             )
-            records = list(
-                self._pm.wait_for_process(
-                    helper_name,
-                    start_timeout,
-                    None,
-                    expected_path=str(self._helper.get("executable", "")),
-                )
-            )
-            if not records:
-                return StepResult(
-                    False,
-                    CODE_START_FAILED,
-                    "管理员计划任务已触发，但未发现 AALC 进程",
-                    {"timeout_s": start_timeout},
-                )
+            if isinstance(outcome, StepResult):
+                return outcome
+            _status, records = outcome
+            self._scheduled_helper_task_started = True
             self._started_helper_pid = records[0].pid
             return StepResult(
                 True,
@@ -294,6 +315,8 @@ class AalcAdapter(AdapterBase):
         - 官方 ``start --exit 6`` 命令已验证会在任务结束后退出游戏和 AALC。
         - LimbusCompany.exe 与 AALC.exe 皆结束才视为完成信号。
         - 不以单一进程消失推断成功。
+        - 与 MAA 对齐：等待循环中重新快照，捕获原 PID 退出后被重启的新 PID，
+          避免在 Limbus/AALC 自我重启时把单次快照的退出误判为完成。
         """
         one_shot_ready, one_shot_details = self._one_shot_command_state()
         if not one_shot_ready:
@@ -334,34 +357,108 @@ class AalcAdapter(AdapterBase):
             )
 
         # 两方 PID 均已捕获，等待双方结束才是完成信号。
-        deadline_remaining = timeout_s
         import time as _time
-        start = _time.monotonic()
-        for name, recs in ((game_name, game_recs), (helper_name, helper_recs)):
-            for rec in recs:
-                elapsed = _time.monotonic() - start
-                remaining = max(0.0, deadline_remaining - elapsed)
-                exited = self._pm.wait_for_exit(rec.pid, remaining, stop_event)
-                if _stop_requested(stop_event):
-                    return StepResult(False, CODE_STOP_REQUESTED, "等待完成时收到停止要求", {})
-                if not exited:
-                    return StepResult(False, CODE_WAIT_TIMEOUT,
-                                      f"等待 {name} 结束超时", {"timeout_s": remaining})
-        return StepResult(
-            True,
-            CODE_OK,
-            "Limbus 与 AALC 皆已结束（start --exit 6 完成信号）",
-            {},
-        )
+        deadline = _time.monotonic() + max(0.0, timeout_s)
+        observed_game_pids = {rec.pid for rec in game_recs}
+        observed_helper_pids = {rec.pid for rec in helper_recs}
+        exited_pids: set[int] = set()
+        # 接管本轮在等待期间新出现的 Limbus/AALC 进程
+        take_ownership = getattr(self._pm, "take_ownership", None)
+        if callable(take_ownership):
+            for rec in game_recs:
+                if rec.pid not in self._owned_game_pids and rec.pid != self._started_game_pid:
+                    claimed = take_ownership(
+                        rec.pid,
+                        expected_path=game_path,
+                        expected_create_time=(
+                            rec.create_time if rec.create_time > 0.0 else None
+                        ),
+                    )
+                    if claimed is not None:
+                        self._owned_game_pids.add(rec.pid)
+
+        while True:
+            if _stop_requested(stop_event):
+                return StepResult(False, CODE_STOP_REQUESTED, "等待完成时收到停止要求", {})
+
+            current_game = [
+                rec for rec in self._pm.find_by_executable(
+                    game_name, expected_path=game_path
+                )
+                if rec.pid not in exited_pids
+            ]
+            current_helper = [
+                rec for rec in self._pm.find_by_executable(
+                    helper_name, expected_path=helper_path
+                )
+                if rec.pid not in exited_pids
+            ]
+            observed_game_pids.update(rec.pid for rec in current_game)
+            observed_helper_pids.update(rec.pid for rec in current_helper)
+            if callable(take_ownership):
+                for rec in current_game:
+                    if rec.pid not in self._owned_game_pids and rec.pid != self._started_game_pid:
+                        claimed = take_ownership(
+                            rec.pid,
+                            expected_path=game_path,
+                            expected_create_time=(
+                                rec.create_time if rec.create_time > 0.0 else None
+                            ),
+                        )
+                        if claimed is not None:
+                            self._owned_game_pids.add(rec.pid)
+
+            live_pids: set[int] = set()
+            for rec in (*current_game, *current_helper):
+                if self._pm.wait_for_exit(rec.pid, 0.0, stop_event):
+                    exited_pids.add(rec.pid)
+                else:
+                    live_pids.add(rec.pid)
+
+            if not live_pids and not current_game and not current_helper:
+                return StepResult(
+                    True,
+                    CODE_OK,
+                    "Limbus 与 AALC 皆已结束（start --exit 6 完成信号）",
+                    {
+                        "game_pids": sorted(observed_game_pids),
+                        "helper_pids": sorted(observed_helper_pids),
+                    },
+                )
+
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                running_names: list[str] = []
+                if current_game:
+                    running_names.append(game_name)
+                if current_helper:
+                    running_names.append(helper_name)
+                return StepResult(
+                    False,
+                    CODE_WAIT_TIMEOUT,
+                    f"等待 {'/'.join(sorted(set(running_names))) or 'Limbus/AALC'} 结束超时",
+                    {
+                        "timeout_s": timeout_s,
+                        "running_processes": sorted(set(running_names)),
+                        "game_pids": sorted(observed_game_pids),
+                        "helper_pids": sorted(observed_helper_pids),
+                    },
+                )
+            _time.sleep(min(self._completion_poll_interval(), remaining))
 
     def cleanup(self) -> StepResult:
-        """只结束本轮启动的 AALC；既有进程与 Steam 游戏均不接管。"""
+        """结束本轮启动的 AALC，并关闭本轮明确接管的 Limbus。
+
+        ``start --exit 6`` 正常情况下会同时关闭游戏与 AALC；这里只作为
+        安全网，接管机制保证 AALC 异常退出时未关闭的 Limbus 也能被收尾，
+        避免残留进程触发下一轮启动屏障死锁。既有进程与未接管的 Steam 游戏
+        仍不会被强行结束。
+        """
         ended: list[int] = []
         failed: list[int] = []
         if self._scheduled_helper_task_started and self._scheduled_helper_task_name:
-            stop_task = getattr(self._pm, "stop_scheduled_task", None)
-            stop_requested = bool(
-                callable(stop_task) and stop_task(self._scheduled_helper_task_name)
+            stop_requested = self._stop_scheduled_task_with_warning(
+                self._scheduled_helper_task_name, kind="AALC"
             )
         else:
             stop_requested = False
@@ -378,12 +475,18 @@ class AalcAdapter(AdapterBase):
             self._started_helper_pid = None
         elif self._scheduled_helper_task_started and not stop_requested:
             failed.append(-1)
+        # 清理本轮明确接管的 Limbus 进程（Steam 协议启动 + take_ownership 路径）
+        for pid in sorted(self._owned_game_pids):
+            ok = self._pm.terminate_if_owned(pid)
+            (ended if ok else failed).append(pid)
+        self._owned_game_pids.clear()
+        self._baseline_game_pids.clear()
         self._scheduled_helper_task_started = False
         if failed:
             return StepResult(
                 False,
                 "not_owned",
-                "部分本轮 AALC 进程已先行退出或无法按计划任务安全关闭；将由退出屏障复查",
+                "部分本轮 AALC/Limbus 进程已先行退出或无法按 owned 规则关闭；将由退出屏障复查",
                 {"ended_pids": ended, "failed_pids": failed},
             )
         return StepResult(True, CODE_OK, "清理完成", {"ended_pids": ended})

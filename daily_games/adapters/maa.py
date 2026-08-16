@@ -33,13 +33,14 @@ from .base import (
 class MaaAdapter(AdapterBase):
     """明日方舟 → MAA 适配器。"""
 
-    def __init__(self, *, game_cfg: Mapping[str, object], process_monitor, logger=None):
+    def __init__(self, *, game_cfg: Mapping[str, object], process_monitor, logger=None, global_options=None):
         super().__init__(
             game_id="arknights",
             display_name=str(game_cfg.get("display_name", "明日方舟")),
             game_cfg=game_cfg,
             process_monitor=process_monitor,
             logger=logger,
+            global_options=global_options,
         )
         helper = game_cfg.get("helper", {}) if isinstance(game_cfg.get("helper"), dict) else {}
         self._helper = helper
@@ -273,45 +274,23 @@ class MaaAdapter(AdapterBase):
             return StepResult(False, CODE_ENV_NOT_READY, "MAA.exe 不存在", {})
 
         if bool(self._helper.get("requires_administrator", False)):
-            start_task = getattr(self._pm, "start_scheduled_task", None)
-            if not self._scheduled_task_name or not callable(start_task):
-                return StepResult(
-                    False,
-                    CODE_ENV_NOT_READY,
-                    "MAA 管理员启动任务不可用",
-                    {},
-                )
-            requested_at = time.time()
-            if not start_task(self._scheduled_task_name):
-                return StepResult(
-                    False,
-                    CODE_START_FAILED,
-                    "无法启动 MAA 管理员计划任务",
-                    {"scheduled_task": self._scheduled_task_name},
-                )
-            self._scheduled_task_started = True
             helper_name = str(self._helper.get("process_name", "MAA.exe"))
-            start_timeout = float(
-                self._helper.get("scheduled_task_start_timeout_s", 30.0)
+            outcome = self._launch_helper_via_scheduled_task(
+                task_name=self._scheduled_task_name,
+                helper_name=helper_name,
+                helper_executable=str(exe),
+                start_timeout_s=float(
+                    self._helper.get("scheduled_task_start_timeout_s", 30.0)
+                ),
+                not_ready_message="MAA 管理员启动任务不可用",
+                start_failed_message="无法启动 MAA 管理员计划任务",
+                no_process_message="管理员计划任务已触发，但未发现 MAA 进程",
             )
-            records = list(
-                self._pm.wait_for_process(
-                    helper_name,
-                    start_timeout,
-                    None,
-                    expected_path=str(self._helper.get("executable", "")),
-                )
-            )
-            if not records:
-                return StepResult(
-                    False,
-                    CODE_START_FAILED,
-                    "管理员计划任务已触发，但未发现 MAA 进程",
-                    {
-                        "scheduled_task": self._scheduled_task_name,
-                        "timeout_s": start_timeout,
-                    },
-                )
+            if isinstance(outcome, StepResult):
+                return outcome
+            _status, records = outcome
+            self._scheduled_task_started = True
+            requested_at = time.time()
             self._started_helper_pid = records[0].pid
             self._helper_launch_time = requested_at
             self._owned_helper_pids.clear()
@@ -464,7 +443,7 @@ class MaaAdapter(AdapterBase):
                         "helper_pids": sorted(observed_helper_pids),
                     },
                 )
-            time.sleep(min(0.2, remaining))
+            time.sleep(min(self._completion_poll_interval(), remaining))
 
     def cleanup(self) -> StepResult:
         """只结束本程序启动的 MAA（如有）。现有 MAA 从不接管。"""
@@ -474,12 +453,11 @@ class MaaAdapter(AdapterBase):
         ended: list[int] = []
         failed: list[int] = []
         if self._scheduled_task_started and self._scheduled_task_name:
-            stop_task = getattr(self._pm, "stop_scheduled_task", None)
-            stop_requested = bool(
-                callable(stop_task) and stop_task(self._scheduled_task_name)
+            stop_requested = self._stop_scheduled_task_with_warning(
+                self._scheduled_task_name, kind="MAA"
             )
             for pid in sorted(pids):
-                if self._pm.wait_for_exit(pid, 5.0, None):
+                if self._pm.wait_for_exit(pid, self._cleanup_grace_timeout(), None):
                     ended.append(pid)
                 elif self._pm.terminate_if_owned(pid):
                     ended.append(pid)
@@ -507,9 +485,9 @@ class MaaAdapter(AdapterBase):
             result = StepResult(True, CODE_OK, "无需清理（本轮未启动 MAA）", {})
 
         if self._scheduled_game_task_started and self._scheduled_game_task_name:
-            stop_task = getattr(self._pm, "stop_scheduled_task", None)
-            if callable(stop_task):
-                stop_task(self._scheduled_game_task_name)
+            self._stop_scheduled_task_with_warning(
+                self._scheduled_game_task_name, kind="鹰角启动器"
+            )
         self._scheduled_game_task_started = False
         return result
 

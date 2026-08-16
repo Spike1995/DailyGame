@@ -47,13 +47,14 @@ _ABORT_NODE_EVENT_RE = re.compile(r"\[msg=Node\.[A-Za-z]+\.(?:Starting|Succeeded
 class MaaEndAdapter(AdapterBase):
     """明日方舟：终末地 → MaaEnd 适配器。"""
 
-    def __init__(self, *, game_cfg: Mapping[str, object], process_monitor, logger=None):
+    def __init__(self, *, game_cfg: Mapping[str, object], process_monitor, logger=None, global_options=None):
         super().__init__(
             game_id="endfield",
             display_name=str(game_cfg.get("display_name", "明日方舟：终末地")),
             game_cfg=game_cfg,
             process_monitor=process_monitor,
             logger=logger,
+            global_options=global_options,
         )
         helper = game_cfg.get("helper", {}) if isinstance(game_cfg.get("helper"), dict) else {}
         self._helper = helper
@@ -241,18 +242,28 @@ class MaaEndAdapter(AdapterBase):
         )
 
     def wait_game_ready(self, timeout_s: float, stop_event: object | None = None) -> StepResult:
+        # 进程出现与主窗口就绪共用同一个总预算，避免把 timeout_s 用两次导致
+        # 实际等待时间翻倍。窗口阶段至少保留 5 秒，避免极端快启动时预算耗尽。
+        import time as _time
+        deadline = _time.monotonic() + max(0.0, timeout_s)
         name = str(self._game_cfg.get("game_process_name", "Endfield.exe"))
         game_path = str(self._game_cfg.get("game_executable", ""))
+        process_budget = max(0.0, deadline - _time.monotonic())
         recs = self._pm.wait_for_process(
             name,
-            timeout_s,
+            process_budget,
             stop_event,
             expected_path=game_path,
         )
         if _stop_requested(stop_event):
             return StepResult(False, CODE_STOP_REQUESTED, "等待游戏进程时收到停止要求", {})
         if not recs:
-            return StepResult(False, CODE_WAIT_TIMEOUT, f"等待 {name} 超时", {"timeout_s": timeout_s})
+            return StepResult(
+                False,
+                CODE_WAIT_TIMEOUT,
+                f"等待 {name} 超时",
+                {"timeout_s": process_budget, "phase": "process"},
+            )
 
         new_records = [rec for rec in recs if rec.pid not in self._baseline_game_pids]
         if not new_records:
@@ -279,21 +290,26 @@ class MaaEndAdapter(AdapterBase):
                 )
             self._owned_game_pids.add(rec.pid)
 
-        # 进一步等待主窗口（window_regex=Endfield，已验证）
+        # 进一步等待主窗口（window_regex=Endfield，已验证）。
+        # 只使用剩余预算，至少 5 秒，避免窗口阶段因进程阶段耗尽预算而立即超时。
         title_regex = self._game_cfg.get("game_window_title_regex")
         if title_regex:
+            window_budget = max(5.0, deadline - _time.monotonic())
             wins = self._pm.wait_for_window(
                 new_records[0].pid,
-                timeout_s,
+                window_budget,
                 stop_event,
                 title_regex=str(title_regex),
             )
             if _stop_requested(stop_event):
                 return StepResult(False, CODE_STOP_REQUESTED, "等待窗口时收到停止要求", {})
             if not wins:
-                return StepResult(False, CODE_WAIT_TIMEOUT,
-                                  f"等待 {name} 主窗口超时（title_regex={title_regex}）",
-                                  {"timeout_s": timeout_s})
+                return StepResult(
+                    False,
+                    CODE_WAIT_TIMEOUT,
+                    f"等待 {name} 主窗口超时（title_regex={title_regex}）",
+                    {"timeout_s": window_budget, "phase": "window"},
+                )
         return StepResult(True, CODE_OK, f"{name} 进程与主窗口已就绪",
                           {"pids": [r.pid for r in recs]})
 
@@ -333,38 +349,22 @@ class MaaEndAdapter(AdapterBase):
             "--quit-after-run",
         ]
         if bool(self._helper.get("requires_administrator", False)):
-            start_task = getattr(self._pm, "start_scheduled_task", None)
-            if not self._scheduled_helper_task_name or not callable(start_task):
-                return StepResult(
-                    False, CODE_ENV_NOT_READY, "MaaEnd 管理员任务不可用", {}
-                )
-            if not start_task(self._scheduled_helper_task_name):
-                return StepResult(
-                    False,
-                    CODE_START_FAILED,
-                    "无法启动 MaaEnd 管理员计划任务",
-                    {"scheduled_task": self._scheduled_helper_task_name},
-                )
-            self._scheduled_helper_task_started = True
             helper_name = str(self._helper.get("process_name", "MaaEnd.exe"))
-            start_timeout = float(
-                self._helper.get("scheduled_task_start_timeout_s", 30.0)
+            outcome = self._launch_helper_via_scheduled_task(
+                task_name=self._scheduled_helper_task_name,
+                helper_name=helper_name,
+                helper_executable=str(exe),
+                start_timeout_s=float(
+                    self._helper.get("scheduled_task_start_timeout_s", 30.0)
+                ),
+                not_ready_message="MaaEnd 管理员任务不可用",
+                start_failed_message="无法启动 MaaEnd 管理员计划任务",
+                no_process_message="管理员计划任务已触发，但未发现 MaaEnd 进程",
             )
-            records = list(
-                self._pm.wait_for_process(
-                    helper_name,
-                    start_timeout,
-                    None,
-                    expected_path=str(self._helper.get("executable", "")),
-                )
-            )
-            if not records:
-                return StepResult(
-                    False,
-                    CODE_START_FAILED,
-                    "管理员计划任务已触发，但未发现 MaaEnd 进程",
-                    {"timeout_s": start_timeout},
-                )
+            if isinstance(outcome, StepResult):
+                return outcome
+            _status, records = outcome
+            self._scheduled_helper_task_started = True
             self._started_helper_pid = records[0].pid
             return StepResult(
                 True,
@@ -454,12 +454,12 @@ class MaaEndAdapter(AdapterBase):
         failed: list[int] = []
         ended: list[int] = []
         if self._scheduled_helper_task_started and self._scheduled_helper_task_name:
-            stop_task = getattr(self._pm, "stop_scheduled_task", None)
-            if callable(stop_task):
-                stop_task(self._scheduled_helper_task_name)
+            self._stop_scheduled_task_with_warning(
+                self._scheduled_helper_task_name, kind="MaaEnd"
+            )
         if self._started_helper_pid is not None:
             if self._scheduled_helper_task_started:
-                ok = self._pm.wait_for_exit(self._started_helper_pid, 5.0, None)
+                ok = self._pm.wait_for_exit(self._started_helper_pid, self._cleanup_grace_timeout(), None)
                 if not ok:
                     ok = self._pm.terminate_if_owned(self._started_helper_pid)
             else:
@@ -467,12 +467,12 @@ class MaaEndAdapter(AdapterBase):
             (ended if ok else failed).append(self._started_helper_pid)
             self._started_helper_pid = None
         if self._scheduled_game_task_started and self._scheduled_game_task_name:
-            stop_task = getattr(self._pm, "stop_scheduled_task", None)
-            if callable(stop_task):
-                stop_task(self._scheduled_game_task_name)
+            self._stop_scheduled_task_with_warning(
+                self._scheduled_game_task_name, kind="终末地启动器"
+            )
         for pid in sorted(self._owned_game_pids):
             if self._scheduled_game_task_started:
-                ok = self._pm.wait_for_exit(pid, 5.0, None)
+                ok = self._pm.wait_for_exit(pid, self._cleanup_grace_timeout(), None)
                 if not ok:
                     ok = self._pm.terminate_if_owned(pid)
             else:

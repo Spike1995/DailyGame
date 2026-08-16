@@ -645,7 +645,7 @@ function New-StartButtonActionSpec {
     }
 
     $metadata = [ordered]@{
-        version = 4
+        version = 5
         launcher_executable = $resolvedLauncherExecutable
         working_directory = $WorkingDirectory
         arguments = ConvertTo-TaskArguments $launcherArgumentValues
@@ -658,7 +658,7 @@ function New-StartButtonActionSpec {
     )
 
     $source = @'
-# DAILY_GAMES_LAUNCHER_WORKER_V4=__WRAPPER_METADATA__
+# DAILY_GAMES_LAUNCHER_WORKER_V5=__WRAPPER_METADATA__
 param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[A-Fa-f0-9]{64}$')]
@@ -751,6 +751,23 @@ namespace DailyGames {
         private static extern IntPtr GetAncestor(IntPtr window, uint flags);
         [DllImport("user32.dll")]
         private static extern bool SetProcessDPIAware();
+
+        public static bool IsForegroundWindow(IntPtr window) {
+            return window != IntPtr.Zero && GetForegroundWindow() == window;
+        }
+
+        public static int[] QueryWindowRect(IntPtr window) {
+            LauncherRect rect;
+            if (window == IntPtr.Zero || !GetWindowRect(window, out rect)) {
+                return null;
+            }
+            return new int[] {
+                rect.Left,
+                rect.Top,
+                rect.Right,
+                rect.Bottom
+            };
+        }
 
         public static bool ActivateVerifiedWindow(IntPtr window) {
             if (window == IntPtr.Zero) return false;
@@ -1125,6 +1142,62 @@ function Test-VerifiedTargetGameProcess {
     return $false
 }
 
+function Wait-InteractionReady {
+    param(
+        [IntPtr]$Window,
+        [datetime]$EarliestClickTime,
+        [datetime]$Deadline
+    )
+    $stableSamples = 0
+    $lastRect = $null
+    while ((Get-Date) -lt $Deadline) {
+        if ((Get-Date) -lt $EarliestClickTime) {
+            Write-AutomationStatus -Code 'window_stability_pending'
+            Start-Sleep -Milliseconds 500
+            continue
+        }
+        if ((Find-LauncherWindowCandidate) -ne $Window) {
+            return 'changed'
+        }
+        if (-not [DailyGames.LauncherNative]::IsForegroundWindow($Window)) {
+            Write-AutomationStatus -Code 'window_stability_pending'
+            [void][DailyGames.LauncherNative]::ActivateVerifiedWindow($Window)
+            $stableSamples = 0
+            $lastRect = $null
+            Start-Sleep -Milliseconds 500
+            continue
+        }
+        $rect = [DailyGames.LauncherNative]::QueryWindowRect($Window)
+        if ($null -eq $rect) {
+            Write-AutomationStatus -Code 'window_stability_pending'
+            $stableSamples = 0
+            $lastRect = $null
+            Start-Sleep -Milliseconds 500
+            continue
+        }
+        if (
+            $null -ne $lastRect -and
+            $rect[0] -eq $lastRect[0] -and
+            $rect[1] -eq $lastRect[1] -and
+            $rect[2] -eq $lastRect[2] -and
+            $rect[3] -eq $lastRect[3]
+        ) {
+            $stableSamples = $stableSamples + 1
+        }
+        else {
+            Write-AutomationStatus -Code 'window_stability_pending'
+            $stableSamples = 1
+        }
+        $lastRect = $rect
+        if ($stableSamples -ge 4) {
+            Write-AutomationStatus -Code 'window_stability_confirmed'
+            return 'ready'
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    return 'timeout'
+}
+
 $script:lastAutomationStatus = ''
 $script:windowVerificationStatus = 'verified_window_not_checked'
 if (-not $nativeTypesReady) {
@@ -1140,20 +1213,53 @@ if (Get-Process -Name '__UNEXPECTED_PROCESS_NAME__' -ErrorAction SilentlyContinu
     Write-AutomationStatus -Code 'unexpected_game_already_running'
     exit 8
 }
+$currentSessionIdForWarmth = (
+    [System.Diagnostics.Process]::GetCurrentProcess()
+).SessionId
+$launcherWasRunning = $false
+foreach ($warmProcess in @(
+    Get-Process -Name 'Games' -ErrorAction SilentlyContinue
+)) {
+    try {
+        if ($warmProcess.SessionId -eq $currentSessionIdForWarmth) {
+            $launcherWasRunning = $true
+        }
+    }
+    catch {
+        $launcherWasRunning = $false
+    }
+}
 try {
     Start-Process `
         -FilePath '__LAUNCHER_EXECUTABLE__' `
         -ArgumentList @('__LAUNCHER_ARGUMENT_1__', '__LAUNCHER_ARGUMENT_2__') `
         -WorkingDirectory '__LAUNCHER_WORKING_DIRECTORY__' `
         -ErrorAction Stop | Out-Null
+    if ($launcherWasRunning) {
+        Write-AutomationStatus -Code 'warm_launcher_detected'
+    }
+    else {
+        Write-AutomationStatus -Code 'cold_launcher_detected'
+    }
     Write-AutomationStatus -Code 'launcher_dispatched'
 }
 catch {
     Write-AutomationStatus -Code 'launcher_dispatch_failed'
     exit 6
 }
+# 冷启动时窗口句柄出现远早于 Qt Web 页面渲染完成；这是首次一键启动
+# 必失败的根因。V5 在冷启动下把首次点击推迟到固定地板时间之后，
+# 并要求窗口（同句柄、同矩形、保持前台）持续稳定后才点击。
+$dispatchTime = Get-Date
+$earliestClickTime = if ($launcherWasRunning) {
+    $dispatchTime
+}
+else {
+    $dispatchTime.AddSeconds(25)
+}
 Start-Sleep -Seconds __INITIAL_DELAY__
 $deadline = (Get-Date).AddSeconds(__TIMEOUT__)
+$sequenceAttempts = 0
 do {
     if (Test-VerifiedTargetGameProcess) {
         Write-AutomationStatus -Code 'target_already_running'
@@ -1177,6 +1283,18 @@ do {
     }
 
     Write-AutomationStatus -Code 'verified_window_activated'
+    $readiness = Wait-InteractionReady `
+        -Window $window `
+        -EarliestClickTime $earliestClickTime `
+        -Deadline $deadline
+    if ($readiness -ne 'ready') {
+        continue
+    }
+    $sequenceAttempts = $sequenceAttempts + 1
+    if ($sequenceAttempts -gt 3) {
+        Write-AutomationStatus -Code 'sequence_attempt_exhausted'
+        exit 4
+    }
     $selected = Invoke-AccessibleButton `
         -Window $window `
         -Name '__GAME_BUTTON_NAME__'
@@ -1203,8 +1321,11 @@ do {
         -not (Test-VerifiedLauncherWindow -Window $window) -or
         -not [DailyGames.LauncherNative]::ActivateVerifiedWindow($window)
     ) {
+        # V4 在此直接放弃（exit 4）。V5 改为回到外层循环，等窗口重新
+        # 稳定后再走完整序列；本轮尚未点击“开始游戏”，重启不会造成
+        # 双重启动，“开始游戏”点击在单次运行内仍至多发生一次。
         Write-AutomationStatus -Code 'window_changed_before_start'
-        exit 4
+        continue
     }
     $selectionState = Get-AccessibleSelectionState `
         -Window $window `

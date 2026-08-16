@@ -404,6 +404,34 @@ def _validate_backup_manifest(
 # --------------------------------------------------------------------------- #
 # ConfigManager                                                                #
 # --------------------------------------------------------------------------- #
+#
+# 本文件 3000+ 行，按职责分节。阅读或修改时按行号定位：
+#
+#   公开入口（保持稳定，被 orchestrator 与 UI 委托）
+#     547  load                       加载并缓存 user.json
+#     583  reconcile_software_paths   软件地址自查与可选修复
+#     923  preflight                  只读环境检查
+#     1113 plan_required_changes      规划一键执行所需变更
+#     1143 apply_required_changes     安全应用变更（暂存 + 原子提交 + 回滚）
+#     1576 backup_files               创建带清单的备份
+#     1697 patch_json                 JSON 键值补丁
+#     1779 patch_yaml_scalars         YAML 标量键补丁
+#     1929 list_backups               枚举备份
+#     1966 restore_backup             从备份恢复
+#
+#   内部辅助（按功能区）
+#     2192 软件地址扫描：_index_software_candidates 等
+#     2548 路径检查：_check_path_exists
+#     2580 MaaEnd 活动实例解析：_maaend_active_instance_state
+#     2625 变更值解析：_resolve_proposed_value / _read_current_value
+#     2694 目标文件解析：_resolve_target_file
+#     2729 补丁应用：_apply_specs_to_one_file
+#     2798 写后验证：_verify_json_values / _verify_yaml_values
+#     2838 备份查找：_find_backup_manifest
+#
+# 本类各方法对 self._config_path / self._config_cache / self._backup_root
+# 有共享依赖；若后续要拆模块，建议把上述功能区逐个提取为接受
+# config_manager 实例的独立函数，再让本类委托调用。
 
 
 class ConfigManager:

@@ -1,0 +1,49 @@
+# 项目配置：ruff 静态检查 + mypy 类型检查。
+# 这两个工具不作为运行时依赖，仅用于开发期质量保证。
+# 使用方式：
+#   pip install ruff mypy
+#   ruff check daily_games tests
+#   mypy daily_games
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"          # 代码使用 PEP 604 (X | Y) 等特性
+extend-exclude = [
+    ".generated",                  # 自动生成的 PowerShell worker 元数据
+    "backups",
+    "logs",
+    "__pycache__",
+]
+
+[tool.ruff.lint]
+# 启用一组保守的规则集，抓常见错误而不过度干涉风格。
+# E/F    pyflakes + pycodestyle 基础错误（未用变量、未定义名等）
+# I      isort（import 顺序）
+# B      bugbear（常见 bug 模式，如 except 后吞异常）
+# UP     pyupgrade（提示可简化的旧语法）
+# W      pycodestyle 警告
+select = ["E", "F", "I", "B", "UP", "W"]
+ignore = [
+    "E501",   # 行长——已由 line-length 控制，且现有代码有大量长中文行
+    "B008",   # 函数默认值里调用函数——本项目 dataclass/Mapping 默认值大量使用
+    "B904",   # raise from——现有代码部分 raise 没带 from，逐个修风险大
+    "E741",   # 模糊变量名——现有代码有 l、i 等短名
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["F401", "F841"]       # 测试中允许未用导入和未用变量
+
+[tool.mypy]
+python_version = "3.12"
+# 本项目 ctypes 调用多、Mapping[str, object] 多，先不 strict，逐步收窄。
+# 目标是先抓出真 bug（None 解引用、类型不匹配），而非风格问题。
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = false            # 现有代码有大量隐式 Any 返回
+no_implicit_optional = true        # 抓 None 默认值类型错误
+check_untyped_defs = true          # 检查未注解函数体
+ignore_missing_imports = true      # Tkinter/ctypes 的 stub 不全
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+ignore_errors = true               # 测试代码暂不强求类型

@@ -236,7 +236,9 @@ class DailyOrchestrator:
 
         self._managed_logger = logger is None
         if logger is None:
-            logger = logging.getLogger(f"daily_games.orchestrator.{id(self)}")
+            # 模块树命名：便于用 logging.config 统一配置，也便于按模块过滤。
+            # 不再使用 id(self)，避免每次实例化都产生新 logger 名。
+            logger = logging.getLogger("daily_games.orchestrator")
             logger.setLevel(logging.INFO)
             logger.propagate = False
             logger.addHandler(logging.NullHandler())
@@ -481,7 +483,7 @@ class DailyOrchestrator:
 
                     # 普通阶段失败已经发布 ``failed``。如果暂停期间收到停止请求，
                     # 该失败仍是主结果；清理或停止事件不得覆盖它。
-                    action = self._wait_for_decision(game_id, result)
+                    action = self._wait_for_decision(game_id, result, config)
                     if action == "retry":
                         continue
                     if action == "skip":
@@ -701,14 +703,27 @@ class DailyOrchestrator:
         self._transition(game_id, STATE_COMPLETED, result.message)
         return result
 
-    def _wait_for_decision(self, game_id: str, result: GameResult) -> str:
-        """发布 paused 状态，等待重试、跳过或停止请求。"""
+    def _wait_for_decision(
+        self,
+        game_id: str,
+        result: GameResult,
+        config: Mapping[str, object] | None = None,
+    ) -> str:
+        """发布 paused 状态，等待重试、跳过或停止请求。
+
+        没有用户决定时也必须有界等待，避免 GUI 关闭或无人值守时工作线程
+        永久阻塞，进而导致单实例锁无法释放。超时时间来自配置
+        ``timeouts.paused_s``；到期后自动按停止处理，使队列安全收尾。
+        """
         self._transition(
             game_id,
             STATE_PAUSED,
             "任务失败，等待重试、跳过或停止。",
             result.code,
         )
+        paused_timeout = self._timeout(config or {}, "paused_s")
+        # 0 或负值表示禁用自动超时；仅用于测试或显式要求无限等待的场景。
+        deadline = None if paused_timeout <= 0 else time.monotonic() + paused_timeout
         with self._control:
             while True:
                 if self._stop_event.is_set() or self._pending_action == "stop":
@@ -718,7 +733,19 @@ class DailyOrchestrator:
                     action = self._pending_action
                     self._pending_action = None
                     return action
-                self._control.wait()
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._pending_action = None
+                        self._stop_event.set()
+                        self._log(
+                            "warning",
+                            f"[{game_id}] 暂停超过 {paused_timeout:.0f}s，自动停止队列。",
+                        )
+                        return "stop"
+                    self._control.wait(timeout=remaining)
+                else:
+                    self._control.wait()
 
     # ------------------------------------------------------------------
     # 运行环境准备
@@ -815,7 +842,13 @@ class DailyOrchestrator:
         config: Mapping[str, object],
         process_monitor: Any,
     ) -> _StepFailure:
-        """启动任何程序前确认六个受管进程均不存在。"""
+        """启动任何程序前确认六个受管进程均不存在。
+
+        屏障失败时返回结构化建议：列出残留进程的可执行文件名与 PID，并给出
+        人工清理指引（关闭对应窗口或任务管理器结束），避免用户在 paused 死等
+        中不知道下一步该做什么。本程序不会自动结束这些进程，因为它们可能属于
+        用户当前正在使用的会话。
+        """
         running: dict[str, list[int]] = {}
         for name in self._configured_process_names(config, GAME_ORDER):
             try:
@@ -834,13 +867,48 @@ class DailyOrchestrator:
                     if isinstance(getattr(record, "pid", None), int)
                 ]
         if running:
+            display_names = self._managed_process_display_names(config)
+            hints: list[str] = []
+            for proc_name, pids in running.items():
+                label = display_names.get(proc_name.casefold(), proc_name)
+                hints.append(f"{label}({proc_name}, PID={','.join(str(p) for p in pids)})")
+            suggestion = (
+                "请先关闭对应游戏窗口或挂机工具，或在任务管理器中结束以上进程，"
+                "再点重试；本程序不会自动结束用户已打开的进程。"
+            )
             return _StepFailure(
                 False,
                 "managed_process_already_running",
-                "检测到已有游戏或助手进程；为避免并发，本轮未启动任何程序。",
-                {"running": running},
+                (
+                    "检测到已有游戏或助手进程；为避免并发，本轮未启动任何程序。"
+                    f"残留：{'；'.join(hints)}。{suggestion}"
+                ),
+                {"running": running, "cleanup_hint": suggestion},
             )
         return _StepFailure(True, "managed_processes_clear", "受管进程启动屏障已通过。", {})
+
+    @staticmethod
+    def _managed_process_display_names(
+        config: Mapping[str, object],
+    ) -> dict[str, str]:
+        """返回进程名(小写)到展示名的映射，用于屏障失败时的人话提示。"""
+        games = config.get("games", {})
+        if not isinstance(games, Mapping):
+            return {}
+        mapping: dict[str, str] = {}
+        for game_id in GAME_ORDER:
+            raw_game = games.get(game_id, {})
+            game = raw_game if isinstance(raw_game, Mapping) else {}
+            display = str(game.get("display_name", game_id))
+            game_name = game.get("game_process_name")
+            if isinstance(game_name, str) and game_name:
+                mapping[game_name.casefold()] = display
+            helper_raw = game.get("helper", {})
+            helper = helper_raw if isinstance(helper_raw, Mapping) else {}
+            helper_name = helper.get("process_name")
+            if isinstance(helper_name, str) and helper_name:
+                mapping[helper_name.casefold()] = f"{display}挂机工具"
+        return mapping
 
     def _wait_for_current_processes_exit(
         self,
@@ -966,7 +1034,7 @@ class DailyOrchestrator:
             handler = logging.FileHandler(log_dir / filename, encoding="utf-8")
             handler.setLevel(log_level)
             handler.setFormatter(logging.Formatter(
-                "%(asctime)s %(levelname)s [%(threadName)s] %(message)s"
+                "%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s"
             ))
             self._logger.addHandler(handler)
             self._run_log_handler = handler
