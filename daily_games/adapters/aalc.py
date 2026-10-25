@@ -149,6 +149,15 @@ class AalcAdapter(AdapterBase):
                 "AALC 官方一次性命令未验证为 start --exit 6，无法安全开始任务",
                 details,
             )
+        # T-008 #2：本轮 Limbus 必须能被安全接管并纳入清理。放在信号检查
+        # 之后，使配置侧诊断码不被监控器问题遮蔽（与 maa/maaend 一致）。
+        if not callable(getattr(self._pm, "take_ownership", None)):
+            return StepResult(
+                False,
+                CODE_ENV_NOT_READY,
+                "进程监控器不支持安全接管本轮启动的 Limbus",
+                details,
+            )
         return StepResult(
             True, CODE_OK,
             ("AALC 环境检查通过" + ("；注意：" + "；".join(warnings) if warnings else "")),
@@ -199,6 +208,9 @@ class AalcAdapter(AdapterBase):
         try:
             rec = self._pm.launch([str(exe)])
             self._started_game_pid = rec.pid
+            # T-008 #2：fallback 直接启动的游戏同样登记为本轮归属，
+            # 保证 AALC 异常退出时 cleanup 也能收尾。
+            self._owned_game_pids.add(rec.pid)
             return StepResult(
                 True, CODE_OK, "已以备用直接可执行文件启动 Limbus",
                 {"method": "direct_executable", "pid": rec.pid, "prior_error": str(prior_exc) if prior_exc else None},
@@ -207,6 +219,13 @@ class AalcAdapter(AdapterBase):
             return StepResult(False, CODE_START_FAILED, f"备用启动失败：{exc}", {})
 
     def wait_game_ready(self, timeout_s: float, stop_event: object | None = None) -> StepResult:
+        """等待本轮新启动的 Limbus 出现，并按精确路径与原生创建身份接管。
+
+        Steam 协议拿不到子进程 PID，靠 ``start_game`` 记录的基线区分本轮
+        实例。基线中的原有实例不接管；空结果、无本轮新 PID（且无已归属的
+        fallback PID）、缺可信原生标识或任一接管失败都返回
+        ``environment_not_ready``，不再返回 ok（T-008 #2）。
+        """
         name = str(self._game_cfg.get("game_process_name", "LimbusCompany.exe"))
         game_path = str(self._game_cfg.get("game_executable", ""))
         recs = self._pm.wait_for_process(
@@ -218,29 +237,68 @@ class AalcAdapter(AdapterBase):
         if _stop_requested(stop_event):
             return StepResult(False, CODE_STOP_REQUESTED, "等待游戏进程时收到停止要求", {})
         if not recs:
-            return StepResult(False, CODE_WAIT_TIMEOUT, f"等待 {name} 超时", {"timeout_s": timeout_s})
-        # 接管本轮新出现的游戏进程，使 cleanup 在 AALC 异常退出时也能收尾
-        # 残留的 Limbus，避免下一轮启动屏障死锁。Fallback 直接启动的 PID
-        # 已在 _launch_fallback 记录，这里补全 Steam 协议路径。
+            # 空结果与「快照全属基线」同属无本轮新 PID 的失败契约
+            # （T-011 R2 教训），保留超时/无进程诊断，零接管。
+            return StepResult(
+                False,
+                CODE_ENV_NOT_READY,
+                f"等待窗口内未出现本轮新启动的 {name}（超时或未启动），无法安全接管并在清理时关闭",
+                {"timeout_s": timeout_s, "pids": []},
+            )
+        # R4：缺接管接口必须按约定失败关闭，而非 AttributeError。
         take_ownership = getattr(self._pm, "take_ownership", None)
-        if callable(take_ownership):
-            for rec in recs:
-                if rec.pid in self._owned_game_pids or rec.pid == self._started_game_pid:
-                    continue
-                if rec.pid in self._baseline_game_pids:
-                    continue
-                claimed = take_ownership(
-                    rec.pid,
-                    expected_path=game_path,
-                    expected_create_time=(
-                        rec.create_time if rec.create_time > 0.0 else None
-                    ),
+        if not callable(take_ownership):
+            return StepResult(
+                False,
+                CODE_ENV_NOT_READY,
+                "进程监控器不支持安全接管本轮启动的 Limbus",
+                {"pids": [r.pid for r in recs]},
+            )
+        confirmed_pids: list[int] = []
+        for rec in recs:
+            if rec.pid in self._baseline_game_pids:
+                # 基线中的原有实例从不接管（T-008 #2）。
+                continue
+            if rec.pid in self._owned_game_pids or rec.pid == self._started_game_pid:
+                # 已归属（fallback 或此前接管）：视为本轮有效证据。
+                confirmed_pids.append(rec.pid)
+                continue
+            if rec.native_create_time <= 0:
+                # 缺原生创建标识无法证明是本轮实例：失败关闭（T-010 语义）。
+                return StepResult(
+                    False,
+                    CODE_ENV_NOT_READY,
+                    f"无法取得 {name}（PID {rec.pid}）的可信创建标识，已停止后续自动化",
+                    {"pid": rec.pid},
                 )
-                if claimed is not None:
-                    self._owned_game_pids.add(rec.pid)
-                    if self._started_game_pid is None:
-                        self._started_game_pid = rec.pid
-        return StepResult(True, CODE_OK, f"{name} 已出现", {"pids": [r.pid for r in recs]})
+            claimed = take_ownership(
+                rec.pid,
+                expected_path=game_path,
+                expected_native_create_time=rec.native_create_time,
+            )
+            if claimed is None:
+                return StepResult(
+                    False,
+                    CODE_ENV_NOT_READY,
+                    f"无法接管本轮启动的 {name}，已停止后续自动化",
+                    {"pid": rec.pid},
+                )
+            self._owned_game_pids.add(rec.pid)
+            if self._started_game_pid is None:
+                self._started_game_pid = rec.pid
+            confirmed_pids.append(rec.pid)
+        if not confirmed_pids:
+            # R1：快照里只有基线中的原有实例不算就绪——本轮没有任何新归属。
+            return StepResult(
+                False,
+                CODE_ENV_NOT_READY,
+                f"等待窗口内只有原有 Limbus 实例，未发现本轮新启动的 {name}",
+                {
+                    "pids": [r.pid for r in recs],
+                    "baseline": sorted(self._baseline_game_pids),
+                },
+            )
+        return StepResult(True, CODE_OK, f"{name} 已出现并完成接管", {"pids": [r.pid for r in recs]})
 
     def start_helper(self) -> StepResult:
         one_shot_ready, one_shot_details = self._one_shot_command_state()
@@ -331,6 +389,9 @@ class AalcAdapter(AdapterBase):
                 "AALC 官方一次性命令未验证，无法可靠判断完成",
                 one_shot_details,
             )
+        # R2：停止优先于快照、单边缺失判断与初始接管。
+        if _stop_requested(stop_event):
+            return StepResult(False, CODE_STOP_REQUESTED, "等待完成时收到停止要求", {})
 
         game_name = str(self._game_cfg.get("game_process_name", "LimbusCompany.exe"))
         helper_name = str(self._helper.get("process_name", "AALC.exe"))
@@ -343,11 +404,48 @@ class AalcAdapter(AdapterBase):
         helper_recs = self._pm.find_by_executable(
             helper_name, expected_path=helper_path
         )
+        if _stop_requested(stop_event):
+            return StepResult(False, CODE_STOP_REQUESTED, "等待完成时收到停止要求", {})
         if not game_recs and not helper_recs:
+            # T-008 #6（AALC）：双方极快退出。只有两侧都有本轮已知 PID，且
+            # 全部确认退出，才按完成处理；停止优先（含快照之后、确认之后
+            # 到达的停止，T-011 R1 教训）。任一侧缺少本轮已知 PID、仍存活
+            # 或无法确认退出，都维持 helper_exited_early。
+            known_game_pids = set(self._owned_game_pids)
+            known_helper_pids: set[int] = set()
+            if self._started_helper_pid is not None:
+                known_helper_pids.add(self._started_helper_pid)
+            if not known_game_pids or not known_helper_pids:
+                if _stop_requested(stop_event):
+                    return StepResult(False, CODE_STOP_REQUESTED, "等待完成时收到停止要求", {})
+                return StepResult(
+                    False, CODE_HELPER_EXITED_EARLY,
+                    "双方进程均已不在快照中，且缺少本轮已知 PID，不能推断完成",
+                    {
+                        "known_game_pids": sorted(known_game_pids),
+                        "known_helper_pids": sorted(known_helper_pids),
+                    },
+                )
+            for pid in sorted(known_game_pids | known_helper_pids):
+                if not self._pm.wait_for_exit(pid, 0, stop_event):
+                    if _stop_requested(stop_event):
+                        return StepResult(False, CODE_STOP_REQUESTED, "等待完成时收到停止要求", {})
+                    return StepResult(
+                        False, CODE_HELPER_EXITED_EARLY,
+                        "双方进程均已不在快照中，但本轮已知 PID 未确认退出",
+                        {"unconfirmed_pid": pid},
+                    )
+            # 停止请求在确认退出后到达时仍然优先，且不走成功重置。
+            if _stop_requested(stop_event):
+                return StepResult(False, CODE_STOP_REQUESTED, "等待完成时收到停止要求", {})
+            self._reset_process_tracking()
             return StepResult(
-                False, CODE_HELPER_EXITED_EARLY,
-                "Limbus 与 AALC 进程皆未找到，无法判断完成",
-                {},
+                True, CODE_OK,
+                "Limbus 与 AALC 皆已结束（start --exit 6 完成信号）",
+                {
+                    "game_pids": sorted(known_game_pids),
+                    "helper_pids": sorted(known_helper_pids),
+                },
             )
         if not game_recs:
             return StepResult(
@@ -368,20 +466,16 @@ class AalcAdapter(AdapterBase):
         observed_game_pids = {rec.pid for rec in game_recs}
         observed_helper_pids = {rec.pid for rec in helper_recs}
         exited_pids: set[int] = set()
-        # 接管本轮在等待期间新出现的 Limbus/AALC 进程
-        take_ownership = getattr(self._pm, "take_ownership", None)
-        if callable(take_ownership):
-            for rec in game_recs:
-                if rec.pid not in self._owned_game_pids and rec.pid != self._started_game_pid:
-                    claimed = take_ownership(
-                        rec.pid,
-                        expected_path=game_path,
-                        expected_create_time=(
-                            rec.create_time if rec.create_time > 0.0 else None
-                        ),
-                    )
-                    if claimed is not None:
-                        self._owned_game_pids.add(rec.pid)
+        # T-008 #2：进入等待前对初始快照做接管，任何失败立即结束等待。
+        for rec in game_recs:
+            failure = self._take_ownership_of_game(rec, game_path)
+            if failure is not None:
+                return StepResult(
+                    False,
+                    CODE_ENV_NOT_READY,
+                    f"无法接管本轮启动的 {game_name}（PID {rec.pid}），已停止等待",
+                    {"pid": rec.pid, "reason": failure},
+                )
 
         while True:
             if _stop_requested(stop_event):
@@ -401,18 +495,17 @@ class AalcAdapter(AdapterBase):
             ]
             observed_game_pids.update(rec.pid for rec in current_game)
             observed_helper_pids.update(rec.pid for rec in current_helper)
-            if callable(take_ownership):
-                for rec in current_game:
-                    if rec.pid not in self._owned_game_pids and rec.pid != self._started_game_pid:
-                        claimed = take_ownership(
-                            rec.pid,
-                            expected_path=game_path,
-                            expected_create_time=(
-                                rec.create_time if rec.create_time > 0.0 else None
-                            ),
-                        )
-                        if claimed is not None:
-                            self._owned_game_pids.add(rec.pid)
+            # T-008 #2：运行中重新快照的新 Limbus 同样必须接管成功，
+            # 不得忽略失败（含自我重启换 PID 的场景）。
+            for rec in current_game:
+                failure = self._take_ownership_of_game(rec, game_path)
+                if failure is not None:
+                    return StepResult(
+                        False,
+                        CODE_ENV_NOT_READY,
+                        f"无法接管本轮启动的 {game_name}（PID {rec.pid}），已停止等待",
+                        {"pid": rec.pid, "reason": failure},
+                    )
 
             live_pids: set[int] = set()
             for rec in (*current_game, *current_helper):
@@ -422,6 +515,34 @@ class AalcAdapter(AdapterBase):
                     live_pids.add(rec.pid)
 
             if not live_pids and not current_game and not current_helper:
+                # R2：快照/确认期间到达的停止请求优先，不走成功重置。
+                if _stop_requested(stop_event):
+                    return StepResult(False, CODE_STOP_REQUESTED, "等待完成时收到停止要求", {})
+                # T-008 #9/R3：快照为空不代表本轮已知 PID 都已确认退出
+                # （如路径查询丢失）；未确认的保留跟踪与诊断，不误判完成。
+                known_pids = (
+                    (observed_game_pids - self._baseline_game_pids)
+                    | self._owned_game_pids
+                    | observed_helper_pids
+                )
+                if self._started_helper_pid is not None:
+                    known_pids.add(self._started_helper_pid)
+                unconfirmed_pids = [
+                    pid
+                    for pid in sorted(known_pids - exited_pids)
+                    if not self._pm.wait_for_exit(pid, 0, stop_event)
+                ]
+                if _stop_requested(stop_event):
+                    return StepResult(False, CODE_STOP_REQUESTED, "等待完成时收到停止要求", {})
+                if unconfirmed_pids:
+                    return StepResult(
+                        False, CODE_HELPER_EXITED_EARLY,
+                        "快照已空，但本轮已知 PID 未确认退出",
+                        {"unconfirmed_pids": unconfirmed_pids},
+                    )
+                # T-008 #9：确认双方退出后才清空跟踪，避免 cleanup 对已
+                # 回收的 PID 再 terminate 制造假 not_owned。
+                self._reset_process_tracking()
                 return StepResult(
                     True,
                     CODE_OK,
@@ -461,41 +582,108 @@ class AalcAdapter(AdapterBase):
         仍不会被强行结束。
         """
         ended: list[int] = []
-        failed: list[int] = []
+        exited: list[int] = []
+        unknown: list[int] = []
+        task_stop_attempted = False
+        task_stop_ok: bool | None = None
         if self._scheduled_helper_task_started and self._scheduled_helper_task_name:
-            stop_requested = self._stop_scheduled_task_with_warning(
+            task_stop_attempted = True
+            task_stop_ok = self._stop_scheduled_task_with_warning(
                 self._scheduled_helper_task_name, kind="AALC"
             )
+            stop_requested = bool(task_stop_ok)
         else:
             stop_requested = False
         if self._started_helper_pid is not None:
-            if self._scheduled_helper_task_started:
-                ok = self._pm.wait_for_exit(
-                    self._started_helper_pid, 5.0, None
-                )
-                if not ok:
-                    ok = self._pm.terminate_if_owned(self._started_helper_pid)
+            pid = self._started_helper_pid
+            if self._pm.terminate_if_owned(pid):
+                ended.append(pid)
+            elif self._pm.wait_for_exit(pid, 5.0, None):
+                exited.append(pid)
             else:
-                ok = self._pm.terminate_if_owned(self._started_helper_pid)
-            (ended if ok else failed).append(self._started_helper_pid)
-            self._started_helper_pid = None
+                unknown.append(pid)
         elif self._scheduled_helper_task_started and not stop_requested:
-            failed.append(-1)
-        # 清理本轮明确接管的 Limbus 进程（Steam 协议启动 + take_ownership 路径）
+            # 任务已触发但未发现助手进程：退出/身份未知。
+            unknown.append(-1)
+        # 清理本轮明确接管的 Limbus 进程（Steam 协议启动 + take_ownership 路径）。
+        # 先终止；终止不可能时用 wait_for_exit 区分「已确认退出」与「未知」。
         for pid in sorted(self._owned_game_pids):
-            ok = self._pm.terminate_if_owned(pid)
-            (ended if ok else failed).append(pid)
-        self._owned_game_pids.clear()
-        self._baseline_game_pids.clear()
-        self._scheduled_helper_task_started = False
-        if failed:
+            if self._pm.terminate_if_owned(pid):
+                ended.append(pid)
+            elif self._pm.wait_for_exit(pid, self._cleanup_grace_timeout(), None):
+                exited.append(pid)
+            else:
+                unknown.append(pid)
+        # T-008 #9/R5：诊断先于重置保留进 details，不用清空集合冒充已退出。
+        self._reset_process_tracking()
+        if unknown:
             return StepResult(
                 False,
                 "not_owned",
                 "部分本轮 AALC/Limbus 进程已先行退出或无法按 owned 规则关闭；将由退出屏障复查",
-                {"ended_pids": ended, "failed_pids": failed},
+                {
+                    "ended_pids": ended,
+                    "exited_pids": exited,
+                    "unknown_pids": unknown,
+                    "task_stop_attempted": task_stop_attempted,
+                    "task_stop_ok": task_stop_ok,
+                },
             )
-        return StepResult(True, CODE_OK, "清理完成", {"ended_pids": ended})
+        return StepResult(
+            True,
+            CODE_OK,
+            "清理完成",
+            {
+                "ended_pids": ended,
+                "exited_pids": exited,
+                "task_stop_attempted": task_stop_attempted,
+                "task_stop_ok": task_stop_ok,
+            },
+        )
+
+    # ------------------------------------------------------------------ #
+    # 内部                                                                #
+    # ------------------------------------------------------------------ #
+
+    def _take_ownership_of_game(self, rec, game_path: str) -> str | None:
+        """接管单个本轮 Limbus PID；成功返回 None，失败返回诊断原因。
+
+        基线中的原有实例不接管也不失败（非本轮归属）；已归属（owned）或
+        fallback 直接启动的 PID 跳过；监控器缺接口、缺可信原生标识或接管
+        被拒一律失败关闭（T-008 #2 / R4）。
+        """
+        if rec.pid in self._baseline_game_pids:
+            # R1：基线是用户原有实例，等待期间出现在快照里也不得交给
+            # take_ownership。
+            return None
+        if rec.pid in self._owned_game_pids or rec.pid == self._started_game_pid:
+            return None
+        take_ownership = getattr(self._pm, "take_ownership", None)
+        if not callable(take_ownership):
+            return "monitor_unsupported"
+        if rec.native_create_time <= 0:
+            return "missing_native_identity"
+        claimed = take_ownership(
+            rec.pid,
+            expected_path=game_path,
+            expected_native_create_time=rec.native_create_time,
+        )
+        if claimed is None:
+            return "take_ownership_rejected"
+        self._owned_game_pids.add(rec.pid)
+        return None
+
+    def _reset_process_tracking(self) -> None:
+        """统一清空本轮进程跟踪（T-008 #9）。
+
+        仅在确认双方退出后返回 ok 之前，或 cleanup 收尾时调用；超时、停止、
+        查询失败、仅一方退出时不得提前调用（诊断先于清空保留）。
+        """
+        self._started_helper_pid = None
+        self._started_game_pid = None
+        self._owned_game_pids.clear()
+        self._baseline_game_pids.clear()
+        self._scheduled_helper_task_started = False
 
 
 def _stop_requested(stop_event: object | None) -> bool:

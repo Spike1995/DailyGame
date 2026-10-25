@@ -7,11 +7,14 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from typing import Mapping
+from unittest import mock
 
 from daily_games.adapters import build_adapters
 from daily_games.adapters.aalc import AalcAdapter
@@ -1759,6 +1762,10 @@ class TestMaaEndAdapter(unittest.TestCase):
 
 
 class TestAalcAdapter(unittest.TestCase):
+    def setUp(self):
+        # R6：拦截 Steam/系统启动入口（本组虽不调 start_game，仍统一设防）。
+        self._startfile_mock, self._popen_mock = _install_system_launch_guard(self)
+
     def test_check_environment_ok_with_warnings(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -1912,6 +1919,9 @@ class TestAalcAdapter(unittest.TestCase):
             pm.set_wait_exit(800, True)
             pm.set_wait_exit(801, True)
             a = AalcAdapter(game_cfg=_limbus_cfg(tmp), process_monitor=pm)
+            # 模拟 wait_game_ready 已完成本轮接管（T-008 #2 后初始快照的
+            # 游戏 PID 必须已归属或可信任接管）。
+            a._owned_game_pids.update({800})
             r = a.wait_completion(timeout_s=5)
             self.assertTrue(r.ok)
 
@@ -1932,7 +1942,10 @@ class TestAalcAdapter(unittest.TestCase):
             for rec in [*game_recs, *helper_recs]:
                 pm.set_wait_exit(rec.pid, True)
 
-            r = AalcAdapter(game_cfg=_limbus_cfg(tmp), process_monitor=pm).wait_completion(timeout_s=5)
+            a = AalcAdapter(game_cfg=_limbus_cfg(tmp), process_monitor=pm)
+            # 模拟 wait_game_ready 已完成本轮接管。
+            a._owned_game_pids.update({800, 802})
+            r = a.wait_completion(timeout_s=5)
 
             self.assertTrue(r.ok)
             self.assertEqual(pm.wait_exit_calls, [800, 802, 801, 803])
@@ -1949,6 +1962,8 @@ class TestAalcAdapter(unittest.TestCase):
             pm.set_find("AALC.exe", [aalc_rec])
             pm.set_wait_exit(800, False)  # 游戏未结束 -> 超时
             a = AalcAdapter(game_cfg=_limbus_cfg(tmp), process_monitor=pm)
+            # 模拟 wait_game_ready 已完成本轮接管。
+            a._owned_game_pids.update({800})
             r = a.wait_completion(timeout_s=1)
             self.assertFalse(r.ok)
             self.assertEqual(r.code, CODE_WAIT_TIMEOUT)
@@ -2214,6 +2229,990 @@ class TestScheduledTaskOwnershipTiming(unittest.TestCase):
                     # wait_for_process 入口处读到的标志已为 True：标记发生在
                     # /Run 之后、等待之前。
                     self.assertEqual(order, [("run", None), ("wait", True)])
+
+
+# --------------------------------------------------------------------------- #
+# AalcAdapter 游戏归属、极快完成与跟踪重置（T-008 #2、#6-AALC、#9）            #
+# --------------------------------------------------------------------------- #
+
+
+def _install_system_launch_guard(testcase):
+    """R6：拦截 AALC 测试中的 Steam/系统协议启动入口。
+
+    真实 ``os.startfile``（Steam 协议）与 ``subprocess.Popen``（非 Windows
+    降级）在守卫期间不可达；Steam 路径的被测语义（method/uri/details）仍可
+    经注入边界断言。返回 (startfile_mock, popen_mock)。
+    """
+    startfile_patch = mock.patch.object(os, "startfile", create=True)
+    popen_patch = mock.patch.object(subprocess, "Popen")
+    startfile_mock = startfile_patch.start()
+    popen_mock = popen_patch.start()
+    testcase.addCleanup(startfile_patch.stop)
+    testcase.addCleanup(popen_patch.stop)
+    return startfile_mock, popen_mock
+
+
+class TestAalcGameOwnership(unittest.TestCase):
+    def setUp(self):
+        # R6：AALC start_game 的 Steam 分支会调用真实系统入口，一律拦截。
+        self._startfile_mock, self._popen_mock = _install_system_launch_guard(self)
+
+    def _game_rec(self, pid=301, native=(2345 << 32) | 77,
+                  full_path="C:\\LimbusCompany.exe") -> ProcessRecord:
+        return ProcessRecord(
+            pid=pid, executable="LimbusCompany.exe", full_path=full_path,
+            owned=False, create_time=1.0, native_create_time=native,
+        )
+
+    def test_wait_game_ready_takeover_succeeds_with_path_and_native(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _limbus_cfg(tmp)
+            pm = FakeProcessMonitor()
+            pm.set_find("LimbusCompany.exe", [self._game_rec(pid=300)])
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+            self.assertTrue(adapter.start_game().ok)
+            self.assertEqual(adapter._baseline_game_pids, {300})
+            pm.set_wait_process("LimbusCompany.exe", [
+                self._game_rec(pid=300), self._game_rec(pid=301),
+            ])
+
+            ready = adapter.wait_game_ready(1)
+
+            self.assertTrue(ready.ok)
+            self.assertEqual(pm.claimed, [301])
+            self.assertEqual(
+                pm.native_claim_calls,
+                [(301, cfg["game_executable"], (2345 << 32) | 77)],
+            )
+            self.assertEqual(adapter._owned_game_pids, {301})
+            # cleanup 终止本轮归属的 301（终止不可能时才降级为确认退出）；
+            # 基线 300 从不触碰。
+            cleanup = adapter.cleanup()
+            self.assertTrue(cleanup.ok)
+            self.assertIn(301, pm.terminated)
+            self.assertNotIn(300, pm.terminated)
+            self.assertNotIn(300, cleanup.details["ended_pids"])
+
+    def test_wait_game_ready_takeover_rejection_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _limbus_cfg(tmp)
+            pm = FakeProcessMonitor()
+            pm.take_ownership_result = False
+            pm.set_wait_process("LimbusCompany.exe", [self._game_rec(pid=301)])
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+
+            ready = adapter.wait_game_ready(1)
+
+            self.assertFalse(ready.ok)
+            self.assertEqual(ready.code, CODE_ENV_NOT_READY)
+            self.assertEqual(ready.details["pid"], 301)
+            self.assertEqual(adapter._owned_game_pids, set())
+            cleanup = adapter.cleanup()
+            self.assertTrue(cleanup.ok)
+            self.assertEqual(pm.terminated, [])
+
+    def test_wait_game_ready_missing_native_identity_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _limbus_cfg(tmp)
+            pm = FakeProcessMonitor()
+            pm.set_wait_process("LimbusCompany.exe", [self._game_rec(pid=301, native=0)])
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+
+            ready = adapter.wait_game_ready(1)
+
+            self.assertFalse(ready.ok)
+            self.assertEqual(ready.code, CODE_ENV_NOT_READY)
+            self.assertEqual(pm.claimed, [])
+            self.assertEqual(adapter._owned_game_pids, set())
+
+    def test_wait_game_ready_empty_result_is_environment_not_ready(self):
+        """R2 教训（T-011）：空结果同属无本轮新 PID，返回 environment_not_ready。"""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _limbus_cfg(tmp)
+            pm = FakeProcessMonitor()
+            pm.set_find("LimbusCompany.exe", [self._game_rec(pid=300)])
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+            self.assertTrue(adapter.start_game().ok)
+            pm.set_wait_process("LimbusCompany.exe", [])
+
+            ready = adapter.wait_game_ready(0)
+
+            self.assertFalse(ready.ok)
+            self.assertEqual(ready.code, CODE_ENV_NOT_READY)
+            self.assertEqual(ready.details["timeout_s"], 0)
+            self.assertEqual(pm.claimed, [])
+            # 停止优先不被改变：预先置位的停止事件仍返回 stop_requested。
+            stop = threading.Event()
+            stop.set()
+            ready = adapter.wait_game_ready(0, stop_event=stop)
+            self.assertEqual(ready.code, CODE_STOP_REQUESTED)
+
+    def test_wait_game_ready_partial_takeover_failure_goes_to_cleanup(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _limbus_cfg(tmp)
+            pm = FakeProcessMonitor()
+            pm.set_wait_process("LimbusCompany.exe", [
+                self._game_rec(pid=301),
+                self._game_rec(pid=302, native=(2345 << 32) | 500),
+            ])
+            real_take = pm.take_ownership
+
+            def _reject_second(pid, **kwargs):
+                if pid == 302:
+                    return None
+                return real_take(pid, **kwargs)
+
+            pm.take_ownership = _reject_second
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+
+            ready = adapter.wait_game_ready(1)
+
+            self.assertFalse(ready.ok)
+            self.assertEqual(ready.code, CODE_ENV_NOT_READY)
+            self.assertEqual(ready.details["pid"], 302)
+            self.assertEqual(adapter._owned_game_pids, {301})
+            # 已接管的部分交给 cleanup：301 被终止收尾；302 未归属不触碰。
+            cleanup = adapter.cleanup()
+            self.assertIn(301, pm.terminated)
+            self.assertNotIn(302, pm.terminated)
+            self.assertTrue(cleanup.ok)
+
+    def test_fallback_launch_is_owned_and_cleaned_up(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _limbus_cfg(tmp)
+            cfg["launch"]["method"] = "direct_executable"
+            pm = FakeProcessMonitor()
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+
+            result = adapter.start_game()
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.details["method"], "direct_executable")
+            pid = result.details["pid"]
+            # T-008 #2：fallback 直接启动的 PID 同样登记为本轮归属。
+            self.assertIn(pid, adapter._owned_game_pids)
+            pm.set_wait_process("LimbusCompany.exe", [ProcessRecord(
+                pid=pid, executable="LimbusCompany.exe",
+                full_path=cfg["launch"]["fallback_executable"],
+                owned=True, create_time=0.0,
+            )])
+            ready = adapter.wait_game_ready(1)
+            self.assertTrue(ready.ok)
+            cleanup = adapter.cleanup()
+            self.assertTrue(cleanup.ok)
+            self.assertEqual(pm.terminated, [pid])
+            self.assertEqual(cleanup.details["ended_pids"], [pid])
+
+    def test_retry_refreshes_baseline_and_does_not_reuse_old_pids(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _limbus_cfg(tmp)
+            pm = FakeProcessMonitor()
+            pm.set_find("LimbusCompany.exe", [self._game_rec(pid=300)])
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+            self.assertTrue(adapter.start_game().ok)
+            self.assertEqual(adapter._baseline_game_pids, {300})
+            # 重试：重新记录基线（替换而非合并），旧 PID 不被沿用。
+            pm.set_find("LimbusCompany.exe", [self._game_rec(pid=400)])
+            self.assertTrue(adapter.start_game().ok)
+            self.assertEqual(adapter._baseline_game_pids, {400})
+
+    def test_wait_game_ready_baseline_only_is_not_success(self):
+        """R1：快照只有基线中的原有实例（无 fallback 归属）时不算就绪。"""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _limbus_cfg(tmp)
+            pm = FakeProcessMonitor()
+            pm.set_find("LimbusCompany.exe", [self._game_rec(pid=300)])
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+            self.assertTrue(adapter.start_game().ok)
+            pm.set_wait_process("LimbusCompany.exe", [self._game_rec(pid=300)])
+
+            ready = adapter.wait_game_ready(1)
+
+            self.assertFalse(ready.ok)
+            self.assertEqual(ready.code, CODE_ENV_NOT_READY)
+            self.assertEqual(pm.claimed, [])
+            self.assertEqual(adapter._owned_game_pids, set())
+            cleanup = adapter.cleanup()
+            self.assertTrue(cleanup.ok)
+            self.assertEqual(pm.terminated, [])
+
+    def test_wait_completion_protects_baseline_pids_in_both_takeover_spots(self):
+        """R1：初始与循环两处接管都不得把基线实例交给 take_ownership。"""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _limbus_cfg(tmp)
+            pm = FakeProcessMonitor()
+            pm.set_find("LimbusCompany.exe", [
+                self._game_rec(pid=300),
+                self._game_rec(pid=301, native=(2345 << 32) | 77),
+            ])
+            pm.set_find("AALC.exe", [ProcessRecord(
+                pid=830, executable="AALC.exe", full_path="C:\\AALC.exe",
+                owned=False, create_time=1.0,
+            )])
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+            adapter._baseline_game_pids = {300}
+            adapter._owned_game_pids = {301}
+            adapter._started_helper_pid = 830
+            # 与适配器视角一致：301 已被接管（可终止），830/300 未接管。
+            pm._owned.add(301)
+            # 循环内重新快照仍同时包含基线 300 与本轮归属的 301。
+            pm.set_find_sequence("LimbusCompany.exe", [
+                [self._game_rec(pid=300), self._game_rec(pid=301)],
+                [self._game_rec(pid=300), self._game_rec(pid=301)],
+            ])
+            pm.set_wait_exit(300, False)
+            pm.set_wait_exit(301, False)
+            pm.set_wait_exit(830, False)
+
+            result = adapter.wait_completion(timeout_s=0)
+
+            self.assertEqual(result.code, CODE_WAIT_TIMEOUT)
+            # 两处接管都保护基线：300 从未被交给 take_ownership。
+            self.assertEqual(
+                [pid for pid, _path, _native in pm.native_claim_calls],
+                [],
+            )
+            self.assertEqual(pm.claimed, [])
+            cleanup = adapter.cleanup()
+            # cleanup 只关闭本轮归属的 301，不触碰基线 300。
+            self.assertIn(301, pm.terminated)
+            self.assertNotIn(300, pm.terminated)
+
+    def test_wait_game_ready_missing_interface_fails_closed(self):
+        """R4：ready 处缺接管接口按 environment_not_ready 失败关闭。"""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _limbus_cfg(tmp)
+            pm = FakeProcessMonitor()
+            pm.set_wait_process("LimbusCompany.exe", [self._game_rec(pid=301)])
+            pm.take_ownership = None  # 缺接口
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+
+            ready = adapter.wait_game_ready(1)
+
+            self.assertFalse(ready.ok)
+            self.assertEqual(ready.code, CODE_ENV_NOT_READY)
+            self.assertIn("不支持安全接管", ready.message)
+            self.assertEqual(pm.claimed, [])
+
+    def test_cleanup_details_record_task_stop_result(self):
+        """R5：任务停止的尝试与结果进入 details，/End 成败可区分。"""
+        for stop_ok in (True, False):
+            with self.subTest(stop_ok=stop_ok):
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    cfg = _limbus_cfg(tmp)
+                    cfg["helper"].update({
+                        "requires_administrator": True,
+                        "scheduled_task_name": "DailyGames-AALC-Admin",
+                    })
+                    pm = FakeProcessMonitor()
+                    pm.set_wait_process("AALC.exe", [ProcessRecord(
+                        pid=830, executable="AALC.exe", full_path="C:\\AALC.exe",
+                        owned=False, create_time=1.0,
+                    )])
+                    pm.stop_scheduled_task_result = stop_ok
+                    pm.set_wait_exit(830, True)
+                    adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+                    self.assertTrue(adapter.start_helper().ok)
+
+                    cleanup = adapter.cleanup()
+
+                    self.assertTrue(cleanup.details["task_stop_attempted"])
+                    self.assertEqual(
+                        cleanup.details["task_stop_ok"], stop_ok,
+                    )
+                    self.assertEqual(cleanup.details["exited_pids"], [830])
+
+    def test_cleanup_details_separate_exited_from_unknown(self):
+        """R5：确认已退出与身份/退出未知分列，不得混成同一列表。"""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _limbus_cfg(tmp)
+            cfg["helper"].update({
+                "requires_administrator": True,
+                "scheduled_task_name": "DailyGames-AALC-Admin",
+            })
+            pm = FakeProcessMonitor()
+            pm.set_wait_process("AALC.exe", [ProcessRecord(
+                pid=830, executable="AALC.exe", full_path="C:\\AALC.exe",
+                owned=False, create_time=1.0,
+            )])
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+            self.assertTrue(adapter.start_helper().ok)
+            # 助手已确认退出；已归属游戏 PID 终止失败且未确认退出
+            # （身份/退出未知），二者分开记录。
+            pm.set_wait_exit(830, True)
+            pm.set_wait_exit(301, False)
+            adapter._owned_game_pids = {301}
+            pm._owned.discard(301)
+
+            cleanup = adapter.cleanup()
+
+            self.assertFalse(cleanup.ok)
+            self.assertEqual(cleanup.code, "not_owned")
+            self.assertEqual(cleanup.details["exited_pids"], [830])
+            self.assertEqual(cleanup.details["unknown_pids"], [301])
+            self.assertNotIn(301, cleanup.details["exited_pids"])
+
+    def test_monitor_without_take_ownership_is_rejected(self):
+        class _NoTakeoverMonitor:
+            def scheduled_task_matches(self, *args, **kwargs):
+                return True
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter = AalcAdapter(
+                game_cfg=_limbus_cfg(tmp), process_monitor=_NoTakeoverMonitor(),
+            )
+
+            result = adapter.check_environment()
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_ENV_NOT_READY)
+            self.assertIn(
+                "进程监控器不支持安全接管本轮启动的 Limbus",
+                result.message,
+            )
+
+
+class TestAalcFastCompletion(unittest.TestCase):
+    """T-008 #6-AALC 与 #9：极快完成与跟踪重置。"""
+
+    def setUp(self):
+        # R6：拦截 Steam/系统启动入口，防止 start_game 真实拉起游戏。
+        self._startfile_mock, self._popen_mock = _install_system_launch_guard(self)
+
+
+    def _ready_adapter(self, tmp: Path):
+        cfg = _limbus_cfg(tmp)
+        pm = FakeProcessMonitor()
+        pm.set_find("LimbusCompany.exe", [ProcessRecord(
+            pid=300, executable="LimbusCompany.exe", full_path="C:\\LimbusCompany.exe",
+            owned=False, create_time=1.0,
+        )])
+        adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+        adapter.start_game()
+        pm.set_find("LimbusCompany.exe", [])
+        pm.set_wait_process("LimbusCompany.exe", [ProcessRecord(
+            pid=301, executable="LimbusCompany.exe", full_path="C:\\LimbusCompany.exe",
+            owned=False, create_time=1.0, native_create_time=(2345 << 32) | 77,
+        )])
+        self.assertTrue(adapter.wait_game_ready(1).ok)
+        self.assertTrue(adapter.start_helper().ok)
+        helper_pid = adapter._started_helper_pid
+        # 双方从快照中消失（极快退出）。
+        pm.set_find("LimbusCompany.exe", [])
+        pm.set_find("AALC.exe", [])
+        return adapter, pm, helper_pid
+
+    def test_both_sides_exited_immediately_is_success_and_resets(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter, pm, helper_pid = self._ready_adapter(tmp)
+
+            result = adapter.wait_completion(timeout_s=1)
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.details["game_pids"], [301])
+            self.assertIn(301, pm.wait_exit_calls)
+            self.assertIn(helper_pid, pm.wait_exit_calls)
+            # T-008 #9：成功重置后 cleanup 干净：无 terminate、无 /End。
+            self.assertEqual(adapter._owned_game_pids, set())
+            self.assertIsNone(adapter._started_game_pid)
+            cleanup = adapter.cleanup()
+            self.assertTrue(cleanup.ok)
+            self.assertEqual(pm.terminated, [])
+            self.assertEqual(pm.stopped_scheduled_tasks, [])
+
+    def test_unknown_game_pid_is_not_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter, pm, _helper_pid = self._ready_adapter(tmp)
+            adapter._owned_game_pids.clear()
+
+            result = adapter.wait_completion(timeout_s=1)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_HELPER_EXITED_EARLY)
+            self.assertEqual(pm.terminated, [])
+
+    def test_unknown_helper_pid_is_not_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter, pm, _helper_pid = self._ready_adapter(tmp)
+            adapter._started_helper_pid = None
+
+            result = adapter.wait_completion(timeout_s=1)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_HELPER_EXITED_EARLY)
+
+    def test_unconfirmed_exit_is_not_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter, pm, _helper_pid = self._ready_adapter(tmp)
+            pm.set_wait_exit(301, False)
+
+            result = adapter.wait_completion(timeout_s=1)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_HELPER_EXITED_EARLY)
+            self.assertEqual(result.details["unconfirmed_pid"], 301)
+
+    def test_one_side_missing_still_fails_fast(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter, pm, _helper_pid = self._ready_adapter(tmp)
+            pm.set_find("LimbusCompany.exe", [ProcessRecord(
+                pid=301, executable="LimbusCompany.exe", full_path="C:\\LimbusCompany.exe",
+                owned=False, create_time=1.0,
+            )])
+
+            result = adapter.wait_completion(timeout_s=1)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_HELPER_EXITED_EARLY)
+            self.assertEqual(result.details["missing"], "helper")
+
+    def test_preset_stop_takes_priority_in_fast_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter, pm, _helper_pid = self._ready_adapter(tmp)
+            pm.set_wait_exit(301, False)
+            stop = threading.Event()
+            stop.set()
+
+            result = adapter.wait_completion(timeout_s=1, stop_event=stop)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_STOP_REQUESTED)
+
+    def test_stop_after_snapshot_with_missing_game_pid_takes_priority(self):
+        """R1 教训（T-011）时序①：缺 PID 出口之前的停止请求优先。
+
+        入口检查时未停止，在首次助手快照返回前置位。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter, pm, _helper_pid = self._ready_adapter(tmp)
+            adapter._owned_game_pids.clear()
+            stop = threading.Event()
+            original_find = pm.find_by_executable
+
+            def find(name, **kwargs):
+                records = original_find(name, **kwargs)
+                if name == "AALC.exe":
+                    stop.set()
+                return records
+
+            pm.find_by_executable = find
+
+            result = adapter.wait_completion(timeout_s=1, stop_event=stop)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_STOP_REQUESTED)
+
+    def test_stop_after_exit_confirmation_returns_stop_without_success_reset(self):
+        """R1 教训（T-011）时序②：确认退出后到达的停止优先，不走成功重置。
+
+        在最后一个已知 PID 确认退出时置位，不依赖 is_set 调用次数。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter, pm, helper_pid = self._ready_adapter(tmp)
+            stop = threading.Event()
+            original_wait = pm.wait_for_exit
+
+            def wait(pid, timeout_s, stop_event=None):
+                exited = original_wait(pid, timeout_s, stop_event)
+                if pid == helper_pid:
+                    stop.set()
+                return exited
+
+            pm.wait_for_exit = wait
+
+            result = adapter.wait_completion(timeout_s=1, stop_event=stop)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_STOP_REQUESTED)
+            self.assertEqual(pm.wait_exit_calls, [301, helper_pid])
+            # 停止路径不走成功重置：跟踪保留，cleanup 仍能看到并收尾双方
+            # （若已被错误重置，cleanup 将没有任何目标可记录）。
+            self.assertEqual(adapter._owned_game_pids, {301})
+            self.assertEqual(adapter._started_helper_pid, helper_pid)
+            cleanup = adapter.cleanup()
+            self.assertTrue(cleanup.ok)
+            self.assertEqual(
+                sorted(cleanup.details["exited_pids"]),
+                sorted([301, helper_pid]),
+            )
+
+    def test_timeout_keeps_tracking_and_cleanup_reports_not_owned(self):
+        """T-008 #9：超时不得提前清空跟踪；cleanup 仍尝试 owned 清理。"""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter, pm, helper_pid = self._ready_adapter(tmp)
+            pm.set_find("LimbusCompany.exe", [ProcessRecord(
+                pid=301, executable="LimbusCompany.exe", full_path="C:\\LimbusCompany.exe",
+                owned=False, create_time=1.0,
+            )])
+            pm.set_find("AALC.exe", [ProcessRecord(
+                pid=helper_pid, executable="AALC.exe", full_path="C:\\AALC.exe",
+                owned=False, create_time=1.0,
+            )])
+            pm.set_wait_exit(301, False)
+
+            result = adapter.wait_completion(timeout_s=0)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_WAIT_TIMEOUT)
+            # 超时不清空：cleanup 仍对 owned 游戏执行终止。
+            self.assertEqual(adapter._owned_game_pids, {301})
+            cleanup = adapter.cleanup()
+            self.assertTrue(cleanup.ok)
+            self.assertIn(301, pm.terminated)
+            self.assertIn(helper_pid, cleanup.details["exited_pids"])
+
+    def test_preset_stop_preempts_initial_takeover_with_zero_new_claims(self):
+        """R2：预置停止优先于单边缺失与初始接管——零新接管。"""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _limbus_cfg(tmp)
+            pm = FakeProcessMonitor()
+            pm.set_find("LimbusCompany.exe", [ProcessRecord(
+                pid=301, executable="LimbusCompany.exe", full_path="C:\\LimbusCompany.exe",
+                owned=False, create_time=1.0, native_create_time=0,
+            )])
+            pm.set_find("AALC.exe", [ProcessRecord(
+                pid=830, executable="AALC.exe", full_path="C:\\AALC.exe",
+                owned=False, create_time=1.0,
+            )])
+            stop = threading.Event()
+            stop.set()
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+
+            result = adapter.wait_completion(timeout_s=1, stop_event=stop)
+
+            # 不返回 helper_exited_early / environment_not_ready，而是停止；
+            # 零接管（缺标识的 301 未被交给 take_ownership）。
+            self.assertEqual(result.code, CODE_STOP_REQUESTED)
+            self.assertEqual(pm.claimed, [])
+            self.assertEqual(pm.terminated, [])
+
+    def test_preset_stop_preempts_one_sided_missing(self):
+        """R2：预置停止优先于单边缺失判断。"""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _limbus_cfg(tmp)
+            pm = FakeProcessMonitor()
+            pm.set_find("LimbusCompany.exe", [ProcessRecord(
+                pid=301, executable="LimbusCompany.exe", full_path="C:\\LimbusCompany.exe",
+                owned=False, create_time=1.0,
+            )])
+            stop = threading.Event()
+            stop.set()
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+
+            result = adapter.wait_completion(timeout_s=1, stop_event=stop)
+
+            self.assertEqual(result.code, CODE_STOP_REQUESTED)
+
+    def test_stop_during_normal_loop_snapshot_returns_stop_without_reset(self):
+        """R2：普通循环第二次快照期间置位的停止优先，不走成功重置。"""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _limbus_cfg(tmp)
+            pm = FakeProcessMonitor()
+            pm.set_find("LimbusCompany.exe", [ProcessRecord(
+                pid=301, executable="LimbusCompany.exe", full_path="C:\\LimbusCompany.exe",
+                owned=False, create_time=1.0, native_create_time=(2345 << 32) | 77,
+            )])
+            pm.set_find("AALC.exe", [ProcessRecord(
+                pid=830, executable="AALC.exe", full_path="C:\\AALC.exe",
+                owned=False, create_time=1.0,
+            )])
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+            adapter._owned_game_pids = {301}
+            adapter._started_helper_pid = 830
+            pm.set_wait_exit(301, False)
+            pm.set_wait_exit(830, False)
+            stop = threading.Event()
+            original_find = pm.find_by_executable
+
+            def find(name, **kwargs):
+                records = original_find(name, **kwargs)
+                if name == "AALC.exe" and len(pm.find_calls) == 4:
+                    stop.set()
+                return records
+
+            pm.find_by_executable = find
+
+            result = adapter.wait_completion(timeout_s=5, stop_event=stop)
+
+            self.assertEqual(result.code, CODE_STOP_REQUESTED)
+            self.assertTrue(stop.is_set())
+            self.assertEqual(len(pm.find_calls), 4)
+            # 不走成功重置：跟踪保留，cleanup 仍尝试关闭双方。
+            self.assertEqual(adapter._owned_game_pids, {301})
+            self.assertEqual(adapter._started_helper_pid, 830)
+            cleanup = adapter.cleanup()
+            self.assertEqual(cleanup.code, "not_owned")
+            self.assertEqual(
+                sorted(cleanup.details["unknown_pids"]),
+                [301, 830],
+            )
+
+    def test_stop_during_initial_single_side_snapshot_preserves_tracking(self):
+        """R2-a：入口未停止，首次快照返回一侧缺失时停止已经到达。"""
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _limbus_cfg(Path(td))
+            pm = FakeProcessMonitor()
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+            adapter._started_game_pid = 301
+            adapter._owned_game_pids = {301}
+            adapter._started_helper_pid = 830
+            pm.set_find("AALC.exe", [ProcessRecord(
+                pid=830, executable="AALC.exe", full_path=cfg["helper"]["executable"],
+                owned=False, create_time=1.0,
+            )])
+            stop = threading.Event()
+            original_find = pm.find_by_executable
+
+            def find(name, **kwargs):
+                self.assertFalse(stop.is_set())
+                records = original_find(name, **kwargs)
+                if name == "AALC.exe":
+                    stop.set()
+                return records
+
+            pm.find_by_executable = find
+
+            result = adapter.wait_completion(timeout_s=0, stop_event=stop)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_STOP_REQUESTED)
+            self.assertTrue(stop.is_set())
+            self.assertEqual(pm.find_calls, [
+                ("LimbusCompany.exe", cfg["game_executable"]),
+                ("AALC.exe", cfg["helper"]["executable"]),
+            ])
+            self.assertEqual(pm.wait_exit_calls, [])
+            self.assertEqual(pm.claimed, [])
+            self.assertEqual(adapter._owned_game_pids, {301})
+            self.assertEqual(adapter._started_game_pid, 301)
+            self.assertEqual(adapter._started_helper_pid, 830)
+            self._startfile_mock.assert_not_called()
+            self._popen_mock.assert_not_called()
+
+    def test_stop_during_final_normal_exit_confirmation_preserves_tracking(self):
+        """R2-b：普通循环的最后一次退出核验内到达停止，不得成功重置。"""
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _limbus_cfg(Path(td))
+            pm = FakeProcessMonitor()
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+            adapter._started_game_pid = 301
+            adapter._owned_game_pids = {301}
+            adapter._baseline_game_pids = {300}
+            adapter._started_helper_pid = 830
+            adapter._scheduled_helper_task_started = True
+            pm._owned.add(301)
+            for name, pid, path in (
+                ("LimbusCompany.exe", 301, cfg["game_executable"]),
+                ("AALC.exe", 830, cfg["helper"]["executable"]),
+            ):
+                pm.set_find_sequence(name, [[ProcessRecord(
+                    pid=pid, executable=name, full_path=path,
+                    owned=False, create_time=1.0,
+                )], []])
+            stop = threading.Event()
+            original_wait = pm.wait_for_exit
+
+            def wait(pid, timeout_s, stop_event=None):
+                self.assertFalse(stop.is_set())
+                exited = original_wait(pid, timeout_s, stop_event)
+                if pid == 830:
+                    stop.set()
+                return exited
+
+            pm.wait_for_exit = wait
+
+            result = adapter.wait_completion(timeout_s=0, stop_event=stop)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_STOP_REQUESTED)
+            self.assertTrue(stop.is_set())
+            self.assertEqual(len(pm.find_calls), 4)
+            self.assertEqual(pm.wait_exit_calls, [301, 830])
+            self.assertEqual(adapter._owned_game_pids, {301})
+            self.assertEqual(adapter._started_game_pid, 301)
+            self.assertEqual(adapter._baseline_game_pids, {300})
+            self.assertEqual(adapter._started_helper_pid, 830)
+            self.assertTrue(adapter._scheduled_helper_task_started)
+            self._startfile_mock.assert_not_called()
+            self._popen_mock.assert_not_called()
+
+    def test_every_observed_helper_must_be_confirmed_exited(self):
+        """R3-a：额外助手快照消失但退出未知时，保留跟踪与任务清理标记。"""
+        for include_baseline in (False, True):
+            with self.subTest(include_baseline=include_baseline), tempfile.TemporaryDirectory() as td:
+                cfg = _limbus_cfg(Path(td))
+                pm = FakeProcessMonitor()
+                adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+                adapter._started_game_pid = 301
+                adapter._owned_game_pids = {301}
+                adapter._baseline_game_pids = {300}
+                adapter._started_helper_pid = 830
+                adapter._scheduled_helper_task_name = "owned-helper"
+                adapter._scheduled_helper_task_started = True
+                pm._owned.add(301)
+                games = [ProcessRecord(
+                    pid=pid, executable="LimbusCompany.exe", full_path=cfg["game_executable"],
+                    owned=False, create_time=1.0,
+                ) for pid in ([300, 301] if include_baseline else [301])]
+                helpers = [ProcessRecord(
+                    pid=pid, executable="AALC.exe", full_path=cfg["helper"]["executable"],
+                    owned=False, create_time=1.0,
+                ) for pid in (830, 831)]
+                pm.set_find_sequence("LimbusCompany.exe", [games, []])
+                pm.set_find_sequence("AALC.exe", [helpers, []])
+                pm.set_wait_exit(300, False)
+                pm.set_wait_exit(301, True)
+                pm.set_wait_exit(830, True)
+                pm.set_wait_exit(831, False)
+
+                result = adapter.wait_completion(timeout_s=0)
+
+                self.assertFalse(result.ok)
+                self.assertEqual(result.code, CODE_HELPER_EXITED_EARLY)
+                self.assertEqual(result.details["unconfirmed_pids"], [831])
+                self.assertEqual(len(pm.find_calls), 4)
+                self.assertEqual(pm.wait_exit_calls, [301, 830, 831])
+                self.assertEqual(pm.claimed, [])
+                self.assertEqual(adapter._owned_game_pids, {301})
+                self.assertEqual(adapter._started_game_pid, 301)
+                self.assertEqual(adapter._baseline_game_pids, {300})
+                self.assertEqual(adapter._started_helper_pid, 830)
+                self.assertTrue(adapter._scheduled_helper_task_started)
+                self.assertEqual(pm.stopped_scheduled_tasks, [])
+                self._startfile_mock.assert_not_called()
+                self._popen_mock.assert_not_called()
+
+    def test_snapshot_vanished_but_known_helper_unconfirmed_is_not_success(self):
+        """R3：快照为空但本轮已知助手未确认退出时，不得按完成重置。"""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _limbus_cfg(tmp)
+            pm = FakeProcessMonitor()
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+            pm.set_wait_process("LimbusCompany.exe", [ProcessRecord(
+                pid=301, executable="LimbusCompany.exe",
+                full_path="C:\\LimbusCompany.exe", owned=False,
+                create_time=1.0, native_create_time=(2345 << 32) | 77,
+            )])
+            self.assertTrue(adapter.wait_game_ready(1).ok)
+            # 先完成助手启动（此时 AALC 快照为空，不触发排重拒绝），
+            # 再让精确路径快照进入「首查存在、复查消失」的序列。
+            self.assertTrue(adapter.start_helper().ok)
+            helper_pid = adapter._started_helper_pid
+            flag_before = adapter._scheduled_helper_task_started
+            pm.set_find_sequence("LimbusCompany.exe", [
+                [ProcessRecord(
+                    pid=301, executable="LimbusCompany.exe",
+                    full_path="C:\\LimbusCompany.exe", owned=False,
+                    create_time=1.0, native_create_time=(2345 << 32) | 77,
+                )],
+                [],
+            ])
+            pm.set_find_sequence("AALC.exe", [
+                [ProcessRecord(
+                    pid=helper_pid, executable="AALC.exe", full_path="C:\\AALC.exe",
+                    owned=False, create_time=1.0,
+                )],
+                [],
+            ])
+            pm.set_wait_exit(301, True)
+            pm.set_wait_exit(helper_pid, False)
+
+            result = adapter.wait_completion(timeout_s=5)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_HELPER_EXITED_EARLY)
+            self.assertEqual(result.details["unconfirmed_pids"], [helper_pid])
+            # 跟踪保留：started/标志不被成功重置清空。
+            self.assertEqual(adapter._started_helper_pid, helper_pid)
+            self.assertEqual(adapter._scheduled_helper_task_started, flag_before)
+
+    def test_wait_completion_initial_takeover_failure_matrix(self):
+        """R4：初始接管 None/缺原生标识 → environment_not_ready。"""
+        cases = [
+            ("takeover_rejected", dict(take_ownership_result=False),
+             (2345 << 32) | 77),
+            ("missing_native", {}, 0),
+        ]
+        for label, pm_kwargs, native in cases:
+            with self.subTest(case=label):
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    cfg = _limbus_cfg(tmp)
+                    pm = FakeProcessMonitor()
+                    for key, value in pm_kwargs.items():
+                        setattr(pm, key, value)
+                    pm.set_find("LimbusCompany.exe", [ProcessRecord(
+                        pid=301, executable="LimbusCompany.exe",
+                        full_path="C:\\LimbusCompany.exe", owned=False,
+                        create_time=1.0, native_create_time=native,
+                    )])
+                    pm.set_find("AALC.exe", [ProcessRecord(
+                        pid=830, executable="AALC.exe", full_path="C:\\AALC.exe",
+                        owned=False, create_time=1.0,
+                    )])
+                    adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+
+                    result = adapter.wait_completion(timeout_s=1)
+
+                    self.assertFalse(result.ok)
+                    self.assertEqual(result.code, CODE_ENV_NOT_READY)
+
+    def test_wait_completion_missing_interface_fails_closed(self):
+        """R4：初始接管缺接口按 environment_not_ready 失败关闭。"""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _limbus_cfg(tmp)
+            pm = FakeProcessMonitor()
+            pm.set_find("LimbusCompany.exe", [ProcessRecord(
+                pid=301, executable="LimbusCompany.exe",
+                full_path="C:\\LimbusCompany.exe", owned=False,
+                create_time=1.0, native_create_time=(2345 << 32) | 77,
+            )])
+            pm.set_find("AALC.exe", [ProcessRecord(
+                pid=830, executable="AALC.exe", full_path="C:\\AALC.exe",
+                owned=False, create_time=1.0,
+            )])
+            pm.take_ownership = None  # 缺接口
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+
+            result = adapter.wait_completion(timeout_s=1)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_ENV_NOT_READY)
+            self.assertEqual(result.details["reason"], "monitor_unsupported")
+
+    def test_wait_completion_running_restart_pid_failure_matrix(self):
+        """R4：循环内重启 PID 接管失败立即返回 environment_not_ready。"""
+        cases = [
+            ("takeover_rejected", dict(take_ownership_result=False),
+             (2345 << 32) | 500),
+            ("missing_native", {}, 0),
+        ]
+        for label, pm_kwargs, native in cases:
+            with self.subTest(case=label):
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    cfg = _limbus_cfg(tmp)
+                    pm = FakeProcessMonitor()
+                    for key, value in pm_kwargs.items():
+                        setattr(pm, key, value)
+                    pm.set_find_sequence("LimbusCompany.exe", [
+                        [ProcessRecord(
+                            pid=301, executable="LimbusCompany.exe",
+                            full_path="C:\\LimbusCompany.exe", owned=False,
+                            create_time=1.0, native_create_time=(2345 << 32) | 77,
+                        )],
+                        [ProcessRecord(
+                            pid=401, executable="LimbusCompany.exe",
+                            full_path="C:\\LimbusCompany.exe", owned=False,
+                            create_time=2.0, native_create_time=native,
+                        )],
+                    ])
+                    pm.set_find("AALC.exe", [ProcessRecord(
+                        pid=830, executable="AALC.exe", full_path="C:\\AALC.exe",
+                        owned=False, create_time=1.0,
+                    )])
+                    pm.set_wait_exit(301, True)
+                    pm.set_wait_exit(830, True)
+                    adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+                    # 模拟 wait_game_ready 已归属初始实例。
+                    adapter._owned_game_pids = {301}
+                    adapter._started_helper_pid = 830
+
+                    result = adapter.wait_completion(timeout_s=5)
+
+                    self.assertFalse(result.ok)
+                    self.assertEqual(result.code, CODE_ENV_NOT_READY)
+                    self.assertEqual(result.details["pid"], 401)
+
+    def test_wait_completion_loop_missing_interface_fails_closed(self):
+        """R4：循环内新 PID 缺接口按 environment_not_ready 失败关闭。"""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _limbus_cfg(tmp)
+            pm = FakeProcessMonitor()
+            pm.set_find_sequence("LimbusCompany.exe", [
+                [ProcessRecord(
+                    pid=301, executable="LimbusCompany.exe",
+                    full_path="C:\\LimbusCompany.exe", owned=False,
+                    create_time=1.0, native_create_time=(2345 << 32) | 77,
+                )],
+                [ProcessRecord(
+                    pid=401, executable="LimbusCompany.exe",
+                    full_path="C:\\LimbusCompany.exe", owned=False,
+                    create_time=2.0, native_create_time=(2345 << 32) | 500,
+                )],
+            ])
+            pm.set_find("AALC.exe", [ProcessRecord(
+                pid=830, executable="AALC.exe", full_path="C:\\AALC.exe",
+                owned=False, create_time=1.0,
+            )])
+            pm.set_wait_exit(301, True)
+            pm.set_wait_exit(830, True)
+            pm.take_ownership = None  # 缺接口
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+            adapter._owned_game_pids = {301}
+            adapter._started_helper_pid = 830
+
+            result = adapter.wait_completion(timeout_s=5)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_ENV_NOT_READY)
+            self.assertEqual(result.details["reason"], "monitor_unsupported")
+
+
+class TestAalcLaunchIsolation(unittest.TestCase):
+    """T-012 R6：AALC 测试禁止真实 Steam/系统协议启动。"""
+
+    def test_steam_start_only_reaches_injected_boundary(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            startfile_mock, popen_mock = _install_system_launch_guard(self)
+            pm = FakeProcessMonitor()
+            adapter = AalcAdapter(game_cfg=_limbus_cfg(tmp), process_monitor=pm)
+
+            result = adapter.start_game()
+
+            # Steam 路径被测语义保留：返回 ok 并携带协议与 URI。
+            self.assertTrue(result.ok)
+            self.assertEqual(result.details["method"], "steam_protocol")
+            # Steam URI 只到达注入边界；真实 os.startfile / Popen 零调用。
+            startfile_mock.assert_called_once_with("steam://run/1973530")
+            popen_mock.assert_not_called()
+            # 边界一旦拒绝调用，Steam 路径即无法继续：真实入口不可达。
+            startfile_mock.side_effect = AssertionError(
+                "测试试图绕过系统启动边界"
+            )
+            with self.assertRaises(AssertionError):
+                adapter.start_game()
+            self.assertEqual(startfile_mock.call_count, 2)
+            popen_mock.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
