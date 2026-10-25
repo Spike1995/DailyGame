@@ -327,6 +327,139 @@ class TestPreflight(unittest.TestCase):
             self.assertEqual(completion.code, "aalc_one_shot_unverified")
 
 
+def _set_limbus_timeouts(user_path: Path, timeouts: object) -> None:
+    data = json.loads(user_path.read_text(encoding="utf-8"))
+    if timeouts is None:
+        data["games"]["limbus"].pop("timeouts", None)
+    else:
+        data["games"]["limbus"]["timeouts"] = timeouts
+    user_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def _activity_policy_results(results):
+    return [r for r in results if r.name == "games.limbus.activity_policy"]
+
+
+class TestPreflightLimbusActivityPolicy(unittest.TestCase):
+    """T-003 §6「配置兼容」行：活动超时键的预检行为。"""
+
+    def test_legacy_without_new_keys_reports_no_activity_result(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            p = _make_user_config(tmp)
+            results = ConfigManager(p, tmp / "b").preflight()
+            self.assertEqual(_activity_policy_results(results), [])
+
+    def test_legacy_with_only_old_completion_s_reports_no_activity_result(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            p = _make_user_config(tmp)
+            _set_limbus_timeouts(p, {"completion_s": 10800})
+            results = ConfigManager(p, tmp / "b").preflight()
+            self.assertEqual(_activity_policy_results(results), [])
+
+    def test_single_idle_key_fills_hard_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            p = _make_user_config(tmp)
+            _set_limbus_timeouts(p, {"completion_idle_s": 600})
+            results = ConfigManager(p, tmp / "b").preflight()
+            activity = _activity_policy_results(results)
+            self.assertEqual(len(activity), 1)
+            self.assertTrue(activity[0].ok)
+            self.assertEqual(activity[0].severity, "info")
+            self.assertEqual(activity[0].details["completion_idle_s"], 600.0)
+            self.assertEqual(activity[0].details["completion_hard_s"], 21600.0)
+
+    def test_custom_values_reported(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            p = _make_user_config(tmp)
+            _set_limbus_timeouts(p, {"completion_idle_s": 1800, "completion_hard_s": 14400})
+            results = ConfigManager(p, tmp / "b").preflight()
+            activity = _activity_policy_results(results)
+            self.assertEqual(len(activity), 1)
+            self.assertTrue(activity[0].ok)
+            self.assertEqual(activity[0].details["completion_idle_s"], 1800.0)
+            self.assertEqual(activity[0].details["completion_hard_s"], 14400.0)
+
+    def test_wrong_location_blocks_preflight(self):
+        placements = [
+            ("global_timeouts", lambda data: data["timeouts"].update({"completion_idle_s": 600})),
+            (
+                "other_game_timeouts",
+                lambda data: data["games"]["arknights"].update(
+                    {"timeouts": {"completion_hard_s": 3600}},
+                ),
+            ),
+        ]
+        for label, mutate in placements:
+            with self.subTest(case=label):
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    p = _make_user_config(tmp)
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                    mutate(data)
+                    p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                    results = ConfigManager(p, tmp / "b").preflight()
+                    activity = _activity_policy_results(results)
+                    self.assertEqual(len(activity), 1)
+                    self.assertFalse(activity[0].ok)
+                    self.assertEqual(activity[0].severity, "error")
+                    self.assertEqual(activity[0].code, "unsupported_location")
+
+    def test_invalid_values_block_preflight(self):
+        invalid_timeouts = [
+            ("bool", {"completion_idle_s": True}),
+            ("null", {"completion_idle_s": None}),
+            ("string", {"completion_hard_s": "600"}),
+            ("zero", {"completion_idle_s": 0}),
+            ("negative", {"completion_hard_s": -5}),
+            ("nan", {"completion_idle_s": float("nan")}),
+            ("infinity", {"completion_hard_s": float("inf")}),
+            ("idle_exceeds_hard", {"completion_idle_s": 7200, "completion_hard_s": 3600}),
+        ]
+        for label, timeouts in invalid_timeouts:
+            with self.subTest(case=label):
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    p = _make_user_config(tmp)
+                    _set_limbus_timeouts(p, timeouts)
+                    results = ConfigManager(p, tmp / "b").preflight()
+                    activity = _activity_policy_results(results)
+                    self.assertEqual(len(activity), 1)
+                    self.assertFalse(activity[0].ok)
+                    self.assertEqual(activity[0].severity, "error")
+                    self.assertIn(
+                        activity[0].code,
+                        ("invalid_value", "idle_exceeds_hard"),
+                    )
+
+    def test_unrepresentable_integer_blocks_preflight(self):
+        # R6：超大整数（合法 JSON 整数）必须成为稳定配置错误，不抛 OverflowError。
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            p = _make_user_config(tmp)
+            _set_limbus_timeouts(p, {"completion_hard_s": 10 ** 400})
+            results = ConfigManager(p, tmp / "b").preflight()
+            activity = _activity_policy_results(results)
+            self.assertEqual(len(activity), 1)
+            self.assertFalse(activity[0].ok)
+            self.assertEqual(activity[0].code, "invalid_value")
+            self.assertEqual(activity[0].severity, "error")
+
+    def test_preflight_rejects_config_without_writing_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            p = _make_user_config(tmp)
+            _set_limbus_timeouts(p, {"completion_idle_s": "abc"})
+            before = p.read_bytes()
+            results = ConfigManager(p, tmp / "b").preflight()
+            self.assertFalse(_activity_policy_results(results)[0].ok)
+            self.assertEqual(p.read_bytes(), before)
+            self.assertFalse((tmp / "b").exists())
+
+
 class TestSoftwarePathSelfCheck(unittest.TestCase):
     def test_read_only_check_reports_unique_candidate_without_writing(self):
         with tempfile.TemporaryDirectory() as td:

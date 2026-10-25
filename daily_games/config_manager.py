@@ -28,6 +28,12 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from uuid import uuid4
 
+from daily_games.completion_policy import (
+    ActivityPolicy,
+    CompletionPolicyError,
+    resolve_limbus_activity_policy,
+)
+
 # --------------------------------------------------------------------------- #
 # 稳定错误码与严重等级                                                       #
 # --------------------------------------------------------------------------- #
@@ -1131,6 +1137,39 @@ class ConfigManager:
                     severity=SEVERITY_INFO if ready else SEVERITY_WARNING,
                     details={**instance_details, "cli_verified": cli_ok},
                 ))
+
+            # limbus 活动超时策略（T-003 §3）：新键只允许 games.limbus.timeouts；
+            # 解析失败是阻止启动的预检失败项。旧配置（无新键）保持 legacy，
+            # 不产生新结果。
+            if gid == "limbus":
+                try:
+                    policy = resolve_limbus_activity_policy(cfg)
+                except CompletionPolicyError as exc:
+                    results.append(CheckResult(
+                        name="games.limbus.activity_policy",
+                        ok=False,
+                        code=exc.code,
+                        message=f"limbus 活动超时配置无效：{exc.message}",
+                        severity=SEVERITY_ERROR,
+                        details={},
+                    ))
+                else:
+                    if isinstance(policy, ActivityPolicy):
+                        results.append(CheckResult(
+                            name="games.limbus.activity_policy",
+                            ok=True,
+                            code=CODE_OK,
+                            message=(
+                                "limbus 活动超时已启用："
+                                f"空闲 {policy.idle_s:g}s / 硬上限 {policy.hard_s:g}s"
+                            ),
+                            severity=SEVERITY_INFO,
+                            details={
+                                "timeout_policy": "activity",
+                                "completion_idle_s": policy.idle_s,
+                                "completion_hard_s": policy.hard_s,
+                            },
+                        ))
 
         return results
 
