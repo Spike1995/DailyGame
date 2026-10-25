@@ -40,6 +40,36 @@ STATE_SKIPPED = "skipped"
 STATE_STOPPING = "stopping"
 STATE_STOPPED = "stopped"
 
+# 本卡只对边狱巴士启用「超时后收尾结论」，其他游戏的失败消息保持原样。
+_LIMBUS_GAME_ID = "limbus"
+# limbus 中需要先复查受管进程再允许重试/跳过的失败码。
+_LIMBUS_DECISION_BARRIER_CODES = frozenset({
+    "wait_timeout",
+    "activity_monitor_unavailable",
+})
+
+# 清理收尾结论：已确认退出 / 仍有残留 / 无法确认。
+_CLOSEOUT_EXITED = "exited"
+_CLOSEOUT_RESIDENT = "resident"
+_CLOSEOUT_UNKNOWN = "unknown"
+
+# 脱敏日志白名单：只允许受控诊断标量，绝不整体输出适配器 details。
+_DIAGNOSTIC_EVIDENCE_KEYS = (
+    "pid",
+    "pids",
+    "command",
+    "timeout_kind",
+    "timeout_policy",
+    "completion_idle_s",
+    "completion_hard_s",
+    "elapsed_s",
+    "idle_age_s",
+    "last_progress_source",
+    "last_progress_category",
+    "log_path",
+    "read_error",
+)
+
 _REDACTED_LOG_VALUE = "<已脱敏>"
 _SENSITIVE_LOG_NAME = (
     r"(?:access[_-]?token|refresh[_-]?token|client[_-]?secret|token|secret|"
@@ -220,6 +250,8 @@ class DailyOrchestrator:
         self._is_running = False
         self._current_game: str | None = None
         self._current_state = STATE_IDLE
+        # 本轮 limbus 失败的清理收尾结论（kind, text）；不写入 GameResult。
+        self._last_failure_closeout: tuple[str, str] | None = None
 
         # ``config/user.json`` 位于项目目录下。这里根据传入的相对项目结构推导，
         # 不依赖特定设备的绝对路径。
@@ -483,7 +515,12 @@ class DailyOrchestrator:
 
                     # 普通阶段失败已经发布 ``failed``。如果暂停期间收到停止请求，
                     # 该失败仍是主结果；清理或停止事件不得覆盖它。
-                    action = self._wait_for_decision(game_id, result, config)
+                    action = self._wait_for_decision(
+                        game_id,
+                        result,
+                        config,
+                        process_monitor=process_monitor,
+                    )
                     if action == "retry":
                         continue
                     if action == "skip":
@@ -514,7 +551,12 @@ class DailyOrchestrator:
                     break
 
             if stopped:
-                self._transition(None, STATE_STOPPED, "队列已安全停止。", "stop_requested")
+                self._transition(
+                    None,
+                    STATE_STOPPED,
+                    self._queue_stopped_message(),
+                    "stop_requested",
+                )
             elif len(results) == len(game_ids):
                 if any(result.state == STATE_SKIPPED for result in results):
                     message = "队列已完成，但包含已跳过的任务。"
@@ -532,6 +574,20 @@ class DailyOrchestrator:
             self._finish_run()
             self._close_run_log()
 
+    def _queue_stopped_message(self) -> str:
+        """停止后的队列文案：不再用「安全停止」暗示第三方已退出。
+
+        收尾结论来自本轮 limbus 失败；已确认退出时明确说明，仍有残留或
+        无法确认时提示用户自行检查。
+        """
+        closeout = self._last_failure_closeout
+        if closeout is None:
+            return "队列调度已停止。"
+        kind, _text = closeout
+        if kind == _CLOSEOUT_EXITED:
+            return "队列调度已停止；本轮游戏与助手进程均已退出。"
+        return "队列调度已停止；第三方进程可能仍在运行，请手动检查。"
+
     def _execute_game(
         self,
         game_id: str,
@@ -546,6 +602,7 @@ class DailyOrchestrator:
         进入下一款游戏。
         """
         started_at = _now_iso()
+        self._last_failure_closeout = None
         failure: _StepFailure | Any | None = None
         stopped = False
         last_success: _StepFailure | Any = _StepFailure(True, "ok", "任务完成", {})
@@ -626,12 +683,21 @@ class DailyOrchestrator:
                     "warning",
                     f"[{game_id}] 阶段失败后的清理也失败：{cleanup.code}",
                 )
+            message = str(failure.message)
+            if game_id == _LIMBUS_GAME_ID and start_barrier.ok:
+                # 主错误（超时/监测失败）保持原样，只把清理与退出屏障的
+                # 结论附加在后面；暂停文案与最终报告复用同一结论。
+                closeout_kind, closeout_text = self._limbus_closeout(
+                    cleanup, exit_barrier
+                )
+                self._last_failure_closeout = (closeout_kind, closeout_text)
+                message = f"{message.rstrip('。；; ')}；{closeout_text}"
             result = self._game_result(
                 game_id,
                 STATE_FAILED,
                 False,
                 failure.code,
-                failure.message,
+                message,
                 started_at,
             )
             self._transition(game_id, STATE_FAILED, result.message, result.code)
@@ -771,44 +837,165 @@ class DailyOrchestrator:
         game_id: str,
         result: GameResult,
         config: Mapping[str, object] | None = None,
+        *,
+        process_monitor: Any | None = None,
     ) -> str:
         """发布 paused 状态，等待重试、跳过或停止请求。
 
         没有用户决定时也必须有界等待，避免 GUI 关闭或无人值守时工作线程
         永久阻塞，进而导致单实例锁无法释放。超时时间来自配置
         ``timeouts.paused_s``；到期后自动按停止处理，使队列安全收尾。
+
+        limbus 超时/监测失败路径的重试与跳过先复查全局受管进程屏障：仍有
+        残留或无法查询时拒绝该动作、保持暂停且不刷新暂停截止时间；停止
+        始终可用。屏障查询在控制锁外执行，不阻塞 UI 线程。
         """
         self._transition(
             game_id,
             STATE_PAUSED,
-            "任务失败，等待重试、跳过或停止。",
+            self._paused_message(result),
             result.code,
         )
         paused_timeout = self._timeout(config or {}, "paused_s")
         # 0 或负值表示禁用自动超时；仅用于测试或显式要求无限等待的场景。
+        # 截止时间只计算一次：被拒绝的重试/跳过不得刷新它。
         deadline = None if paused_timeout <= 0 else time.monotonic() + paused_timeout
-        with self._control:
-            while True:
-                if self._stop_event.is_set() or self._pending_action == "stop":
-                    self._pending_action = None
-                    return "stop"
-                if self._pending_action in {"retry", "skip"}:
-                    action = self._pending_action
-                    self._pending_action = None
-                    return action
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        self._pending_action = None
-                        self._stop_event.set()
-                        self._log(
-                            "warning",
-                            f"[{game_id}] 暂停超过 {paused_timeout:.0f}s，自动停止队列。",
-                        )
-                        return "stop"
-                    self._control.wait(timeout=remaining)
+        needs_barrier = (
+            process_monitor is not None
+            and game_id == _LIMBUS_GAME_ID
+            and str(result.code) in _LIMBUS_DECISION_BARRIER_CODES
+        )
+        while True:
+            with self._control:
+                action = self._await_control_action(
+                    game_id, paused_timeout, deadline
+                )
+            if action == "stop" or not needs_barrier:
+                return action
+            # 控制锁外复查全局受管进程屏障，避免阻塞 UI 线程。
+            barrier = self._check_managed_processes_clear(
+                config or {}, process_monitor
+            )
+            self._log_step_evidence(game_id, f"{action}_process_barrier", barrier)
+            if barrier.ok:
+                return action
+            label = "重试" if action == "retry" else "跳过"
+            self._transition(
+                game_id,
+                STATE_PAUSED,
+                (
+                    f"已拒绝{label}：{barrier.message}"
+                    "处理完成后可再次选择重试或跳过；也可停止队列。"
+                ),
+                result.code,
+            )
+
+    def _limbus_closeout(
+        self,
+        cleanup: Any,
+        exit_barrier: Any,
+    ) -> tuple[str, str]:
+        """把清理与退出屏障结论合成 limbus 失败消息的受控措辞。
+
+        只有 managed_process_still_running 允许断言仍有进程在运行；
+        查询或等待失败等未知结果只能写「无法确认是否退出」。not_owned
+        本身不是权限诊断，不得据此推断仍在运行。
+        """
+        cleanup_ok = bool(getattr(cleanup, "ok", False))
+        cleanup_code = str(getattr(cleanup, "code", ""))
+        if bool(getattr(exit_barrier, "ok", False)):
+            if cleanup_ok:
+                return _CLOSEOUT_EXITED, "退出屏障已确认进程均已退出"
+            return (
+                _CLOSEOUT_EXITED,
+                f"清理返回 {cleanup_code}，随后退出屏障确认进程均已退出",
+            )
+        prefix = "" if cleanup_ok else f"清理返回 {cleanup_code}；"
+        if str(getattr(exit_barrier, "code", "")) == "managed_process_still_running":
+            return (
+                _CLOSEOUT_RESIDENT,
+                (
+                    f"{prefix}{self._residual_process_text(exit_barrier)}"
+                    "仍在运行且无法按当前所有权规则结束"
+                ),
+            )
+        return _CLOSEOUT_UNKNOWN, f"{prefix}无法确认 AALC 与游戏是否退出"
+
+    @staticmethod
+    def _residual_process_text(exit_barrier: Any) -> str:
+        """按受管进程名生成「AALC（PID …）、游戏（PID …）」片段。"""
+        details = getattr(exit_barrier, "details", {})
+        running = details.get("running", {}) if isinstance(details, Mapping) else {}
+        parts: list[str] = []
+        if isinstance(running, Mapping):
+            for name, pids in running.items():
+                lowered = str(name).casefold()
+                if "aalc" in lowered:
+                    label = "AALC"
+                elif "limbus" in lowered:
+                    label = "游戏"
                 else:
-                    self._control.wait()
+                    label = str(name)
+                pid_values = (
+                    [str(pid) for pid in pids if isinstance(pid, int)]
+                    if isinstance(pids, (list, tuple))
+                    else []
+                )
+                pid_text = ",".join(pid_values) if pid_values else "未知"
+                parts.append(f"{label}（PID {pid_text}）")
+        return "、".join(parts) if parts else "第三方进程"
+
+    def _await_control_action(
+        self,
+        game_id: str,
+        paused_timeout: float,
+        deadline: float | None,
+    ) -> str:
+        """持锁等待下一个控制动作，返回 stop / retry / skip。
+
+        暂停到期只停止调度，不自动恢复，也不启动下一款游戏。
+        """
+        while True:
+            if self._stop_event.is_set() or self._pending_action == "stop":
+                self._pending_action = None
+                return "stop"
+            if self._pending_action in {"retry", "skip"}:
+                action = self._pending_action
+                self._pending_action = None
+                return action
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._pending_action = None
+                    self._stop_event.set()
+                    self._log(
+                        "warning",
+                        f"[{game_id}] 暂停超过 {paused_timeout:.0f}s，自动停止队列。",
+                    )
+                    return "stop"
+                self._control.wait(timeout=remaining)
+            else:
+                self._control.wait()
+
+    def _paused_message(self, result: GameResult) -> str:
+        """暂停文案：limbus 失败时带上本轮清理收尾结论。
+
+        没有收尾结论（其他游戏，或本轮未启动）时保持原通用文案。
+        """
+        closeout = self._last_failure_closeout
+        if closeout is None:
+            return "任务失败，等待重试、跳过或停止。"
+        kind, _text = closeout
+        if kind == _CLOSEOUT_EXITED:
+            tail = "队列已暂停；可直接重试或跳过，也可停止队列。"
+        elif kind == _CLOSEOUT_RESIDENT:
+            tail = "队列已暂停，请手动退出 AALC 和游戏后重试或跳过；也可停止队列。"
+        else:
+            tail = (
+                "队列已暂停，请先确认 AALC 和游戏是否仍在运行，"
+                "处理完成后重试或跳过；也可停止队列。"
+            )
+        return f"{str(result.message).rstrip('。；; ')}。{tail}"
 
     # ------------------------------------------------------------------
     # 运行环境准备
@@ -1314,12 +1501,13 @@ class DailyOrchestrator:
         """记录经过结构化遮罩的最小运行证据。
 
         适配器 ``details`` 可能包含任意诊断数据，其中也可能有源自配置的值。
-        本方法只允许进程 ID 和启动命令，并在格式化前递归遮罩敏感值。
+        本方法只允许进程 ID、启动命令与设计列出的超时/活动诊断标量，并在
+        格式化前递归遮罩敏感值；绝不整体输出 details 或第三方日志行。
         """
         fields: dict[str, object] = {}
         details = getattr(result, "details", {})
         if isinstance(details, Mapping):
-            for key in ("pid", "pids", "command"):
+            for key in _DIAGNOSTIC_EVIDENCE_KEYS:
                 if key in details:
                     fields[key] = _redact_log_value(details[key])
         suffix = f" 证据={fields!r}" if fields else ""

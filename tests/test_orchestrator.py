@@ -1480,5 +1480,377 @@ class OrchestratorTests(unittest.TestCase):
                 self.assertEqual(monitor.unsafe_calls, [])
 
 
+class LimbusCloseoutMonitor:
+    """limbus 收尾用例的进程表：启动屏障无进程，cleanup 后按剧本作答。"""
+
+    def __init__(self, outcome: str, *, game_pid: int = 4100, helper_pid: int = 4101):
+        self.outcome = outcome
+        self.exit_phase = False
+        self.game_pid = game_pid
+        self.helper_pid = helper_pid
+        self.queries: list[str] = []
+
+    def _record(self, name: str, pid: int) -> ProcessRecord:
+        return ProcessRecord(
+            pid=pid,
+            executable=str(name),
+            full_path=f"C:\\fake\\{name}",
+            owned=False,
+            create_time=0.0,
+        )
+
+    def find_by_executable(self, name):
+        self.queries.append(str(name))
+        if not self.exit_phase:
+            return []
+        if self.outcome == "query_failed":
+            raise RuntimeError("枚举失败")
+        if self.outcome == "exited":
+            return []
+        lowered = str(name).casefold()
+        if lowered == "aalc.exe":
+            return [self._record(name, self.helper_pid)]
+        if lowered == "limbuscompany.exe":
+            return [self._record(name, self.game_pid)]
+        return []
+
+    def wait_for_exit(self, pid, timeout_s, stop_event=None):
+        return False
+
+
+class LimbusFailAdapter(FakeAdapter):
+    """wait_completion 直接触发 limbus 超时；cleanup 时切入退出屏障剧本。"""
+
+    def __init__(
+        self,
+        monitor: LimbusCloseoutMonitor,
+        *,
+        code: str = "wait_timeout",
+        message: str = "已连续 45 分钟未观察到任务进展",
+        details: dict[str, object] | None = None,
+        cleanup_outcome: Any = None,
+    ):
+        outcomes = {"cleanup": [cleanup_outcome]} if cleanup_outcome is not None else None
+        super().__init__(outcomes)
+        self.monitor = monitor
+        self.failure = Step(False, code, message, dict(details or {}))
+
+    def wait_completion(self, timeout_s, stop_event):
+        self.calls.append("wait_completion")
+        self.wait_completion_args.append((timeout_s, stop_event))
+        return self.failure
+
+    def cleanup(self):
+        self.monitor.exit_phase = True
+        return super().cleanup()
+
+
+def limbus_failure_config(*, paused_s: float = 0.0) -> dict:
+    """带全部进程名的 limbus 失败配置；暂停截止由用例显式控制。"""
+    config = stopped_diagnostic_config()
+    config["timeouts"]["paused_s"] = paused_s
+    return config
+
+
+def make_limbus_orchestrator(
+    monitor: LimbusCloseoutMonitor,
+    adapter: LimbusFailAdapter,
+    *,
+    config: dict | None = None,
+    logger: FakeLogger | None = None,
+) -> DailyOrchestrator:
+    return DailyOrchestrator(
+        Path("test-root") / "config" / "user.json",
+        config_manager=FakeConfigManager(config or limbus_failure_config()),
+        process_monitor=monitor,
+        adapters=make_adapters(limbus=adapter),
+        logger=logger or FakeLogger(),
+    )
+
+
+class LimbusCloseoutTests(unittest.TestCase):
+    def _run_and_stop(self, orchestrator, adapter, *, wait_paused=2.0):
+        events = []
+        paused = threading.Event()
+
+        def listener(event):
+            events.append(event)
+            if event.state == STATE_PAUSED:
+                paused.set()
+
+        orchestrator.add_listener(listener)
+        thread, box = run_in_thread(lambda: orchestrator.run_one("limbus"))
+        self.assertTrue(paused.wait(wait_paused))
+        orchestrator.request_stop()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("error", box)
+        return box["result"], events
+
+    def test_timeout_stays_primary_error_with_cleanup_conclusion(self):
+        monitor = LimbusCloseoutMonitor("resident")
+        adapter = LimbusFailAdapter(
+            monitor, cleanup_outcome=Step(False, "not_owned", "已无法按 ownership 结束")
+        )
+        orchestrator = make_limbus_orchestrator(monitor, adapter)
+
+        report, events = self._run_and_stop(orchestrator, adapter)
+
+        result = report.results[0]
+        self.assertEqual(result.state, STATE_FAILED)
+        self.assertEqual(result.code, "wait_timeout")
+        self.assertIn("已连续 45 分钟未观察到任务进展", result.message)
+        self.assertIn("清理返回 not_owned", result.message)
+        self.assertIn("AALC（PID 4101）", result.message)
+        self.assertIn("游戏（PID 4100）", result.message)
+        self.assertIn("仍在运行且无法按当前所有权规则结束", result.message)
+        paused_event = next(event for event in events if event.state == STATE_PAUSED)
+        self.assertIn("仍在运行且无法按当前所有权规则结束", paused_event.message)
+        self.assertIn("请手动退出 AALC 和游戏后重试或跳过", paused_event.message)
+        self.assertEqual(paused_event.error_code, "wait_timeout")
+
+    def test_barrier_confirmed_exit_is_reported_as_exited(self):
+        monitor = LimbusCloseoutMonitor("exited")
+        adapter = LimbusFailAdapter(monitor)
+        orchestrator = make_limbus_orchestrator(monitor, adapter)
+
+        report, events = self._run_and_stop(orchestrator, adapter)
+
+        result = report.results[0]
+        self.assertEqual(result.code, "wait_timeout")
+        self.assertIn("退出屏障已确认进程均已退出", result.message)
+        paused_event = next(event for event in events if event.state == STATE_PAUSED)
+        self.assertIn("退出屏障已确认进程均已退出", paused_event.message)
+        self.assertIn("可直接重试或跳过", paused_event.message)
+        self.assertNotIn("仍在运行", paused_event.message)
+
+    def test_query_failure_is_reported_as_unknown(self):
+        monitor = LimbusCloseoutMonitor("query_failed")
+        adapter = LimbusFailAdapter(monitor)
+        orchestrator = make_limbus_orchestrator(monitor, adapter)
+
+        report, events = self._run_and_stop(orchestrator, adapter)
+
+        result = report.results[0]
+        self.assertEqual(result.code, "wait_timeout")
+        self.assertIn("无法确认 AALC 与游戏是否退出", result.message)
+        self.assertNotIn("仍在运行", result.message)
+        self.assertNotIn("均已退出", result.message)
+        paused_event = next(event for event in events if event.state == STATE_PAUSED)
+        self.assertIn("无法确认 AALC 与游戏是否退出", paused_event.message)
+        self.assertIn("请先确认 AALC 和游戏是否仍在运行", paused_event.message)
+
+
+    def test_residual_process_blocks_retry_and_skip_even_for_last_game(self):
+        monitor = LimbusCloseoutMonitor("resident")
+        adapter = LimbusFailAdapter(monitor)
+        # 关闭自动暂停超时，确保队列只因用户操作结束。
+        orchestrator = make_limbus_orchestrator(
+            monitor, adapter, config=limbus_failure_config(paused_s=0.0)
+        )
+        events = []
+        paused = threading.Event()
+
+        def listener(event):
+            events.append(event)
+            if event.state == STATE_PAUSED:
+                paused.set()
+
+        orchestrator.add_listener(listener)
+        thread, box = run_in_thread(lambda: orchestrator.run_one("limbus"))
+        self.assertTrue(paused.wait(2))
+
+        orchestrator.retry_current()
+        self.assertTrue(self._wait_for_paused_count(events, 2))
+        self.assertEqual(orchestrator.current_state, STATE_PAUSED)
+        self.assertIn("已拒绝重试", events[-1].message)
+
+        orchestrator.skip_current()
+        self.assertTrue(self._wait_for_paused_count(events, 3))
+        self.assertEqual(orchestrator.current_state, STATE_PAUSED)
+        self.assertIn("已拒绝跳过", events[-1].message)
+
+        orchestrator.request_stop()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("error", box)
+        report = box["result"]
+        self.assertTrue(report.stopped)
+        self.assertEqual(adapter.calls.count("wait_completion"), 1)
+        self.assertEqual(adapter.calls.count("cleanup"), 1)
+        self.assertEqual(report.results[0].state, STATE_FAILED)
+        self.assertEqual(report.results[0].code, "wait_timeout")
+
+    @staticmethod
+    def _wait_for_paused_count(events, count, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if sum(1 for event in events if event.state == STATE_PAUSED) >= count:
+                time.sleep(0.05)
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_rejected_retry_does_not_refresh_pause_deadline(self):
+        monitor = LimbusCloseoutMonitor("resident")
+        adapter = LimbusFailAdapter(monitor)
+        orchestrator = make_limbus_orchestrator(
+            monitor, adapter, config=limbus_failure_config(paused_s=1.0)
+        )
+        paused = threading.Event()
+        orchestrator.add_listener(
+            lambda event: paused.set() if event.state == STATE_PAUSED else None
+        )
+
+        thread, box = run_in_thread(lambda: orchestrator.run_one("limbus"))
+        self.assertTrue(paused.wait(2))
+        paused_at = time.monotonic()
+        time.sleep(0.6)
+        orchestrator.retry_current()
+        thread.join(4)
+
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("error", box)
+        elapsed = time.monotonic() - paused_at
+        # 若拒绝时刷新截止时间，停止会推到 ~1.6s 之后。
+        self.assertLess(elapsed, 1.4)
+        self.assertGreaterEqual(elapsed, 0.9)
+        self.assertTrue(box["result"].stopped)
+        self.assertEqual(adapter.calls.count("wait_completion"), 1)
+
+    def test_pause_timeout_stops_queue_without_rerunning_game(self):
+        monitor = LimbusCloseoutMonitor("resident")
+        adapter = LimbusFailAdapter(monitor)
+        orchestrator = make_limbus_orchestrator(
+            monitor, adapter, config=limbus_failure_config(paused_s=0.3)
+        )
+        events = []
+        orchestrator.add_listener(events.append)
+
+        report = orchestrator.run_one("limbus")
+
+        self.assertTrue(report.stopped)
+        self.assertFalse(report.ok)
+        self.assertEqual(len(report.results), 1)
+        self.assertEqual(report.results[0].state, STATE_FAILED)
+        self.assertEqual(adapter.calls.count("wait_completion"), 1)
+        self.assertEqual(
+            [event.state for event in events].count(STATE_FAILED), 1
+        )
+        final = events[-1]
+        self.assertEqual(final.state, STATE_STOPPED)
+        self.assertEqual(final.message, "队列调度已停止；第三方进程可能仍在运行，请手动检查。")
+
+    def test_stop_message_never_claims_third_party_closed(self):
+        monitor = LimbusCloseoutMonitor("resident")
+        adapter = LimbusFailAdapter(monitor)
+        orchestrator = make_limbus_orchestrator(monitor, adapter)
+
+        _report, events = self._run_and_stop(orchestrator, adapter)
+
+        final = events[-1]
+        self.assertEqual(final.state, STATE_STOPPED)
+        self.assertIn("队列调度已停止", final.message)
+        self.assertNotIn("安全停止", final.message)
+        self.assertIn("第三方进程可能仍在运行，请手动检查", final.message)
+        # 只有队列/游戏的停止结果不得暗示第三方已退出；停止请求的
+        # "收到安全停止请求" 只是控制回执。
+        stopped_results = [
+            event
+            for event in events
+            if event.state in {STATE_STOPPED, STATE_COMPLETED}
+        ]
+        self.assertTrue(stopped_results)
+        for event in stopped_results:
+            self.assertNotIn("安全停止", event.message)
+
+    def test_exited_closeout_stop_message_reports_processes_gone(self):
+        monitor = LimbusCloseoutMonitor("exited")
+        adapter = LimbusFailAdapter(monitor)
+        orchestrator = make_limbus_orchestrator(monitor, adapter)
+
+        _report, events = self._run_and_stop(orchestrator, adapter)
+
+        final = events[-1]
+        self.assertEqual(final.state, STATE_STOPPED)
+        self.assertEqual(final.message, "队列调度已停止；本轮游戏与助手进程均已退出。")
+        self.assertNotIn("可能仍在运行", final.message)
+
+    def test_non_limbus_failure_keeps_generic_pause_message(self):
+        failing = FakeAdapter({
+            "wait_completion": [Step(False, "wait_timeout", "日常任务超时")],
+        })
+        orchestrator = make_orchestrator(adapters=make_adapters(arknights=failing))
+        paused_event = []
+        paused = threading.Event()
+
+        def listener(event):
+            if event.state == STATE_PAUSED:
+                paused_event.append(event)
+                paused.set()
+
+        orchestrator.add_listener(listener)
+        thread, box = run_in_thread(lambda: orchestrator.run_one("arknights"))
+        self.assertTrue(paused.wait(2))
+        orchestrator.request_stop()
+        thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("error", box)
+        self.assertEqual(
+            paused_event[0].message, "任务失败，等待重试、跳过或停止。"
+        )
+        self.assertEqual(box["result"].results[0].message, "日常任务超时")
+
+    def test_step_evidence_logs_only_controlled_diagnostics(self):
+        logger = FakeLogger()
+        orchestrator = make_orchestrator(logger=logger)
+        result = Step(
+            False,
+            "wait_timeout",
+            "已连续 45 分钟未观察到任务进展",
+            {
+                "pid": 4321,
+                "timeout_kind": "idle",
+                "timeout_policy": "activity",
+                "completion_idle_s": 2700,
+                "completion_hard_s": 21600,
+                "elapsed_s": 2900.5,
+                "idle_age_s": 2700.0,
+                "last_progress_source": "mirror",
+                "last_progress_category": "任务结束",
+                "log_path": "logs/debugLog.log",
+                "read_error": "permission_denied",
+                "helper_pids": [1, 2],
+                "details": {"api_key": "sk-should-not-appear"},
+                "api_key": "sk-should-not-appear",
+            },
+        )
+
+        orchestrator._log_step_evidence("limbus", "wait_completion", result)
+
+        line = logger.entries[-1][1]
+        for key in (
+            "timeout_kind",
+            "timeout_policy",
+            "completion_idle_s",
+            "completion_hard_s",
+            "elapsed_s",
+            "idle_age_s",
+            "last_progress_source",
+            "last_progress_category",
+            "log_path",
+            "read_error",
+            "pid",
+        ):
+            self.assertIn(key, line)
+        self.assertIn("'idle'", line)
+        self.assertIn("'activity'", line)
+        self.assertNotIn("sk-should-not-appear", line)
+        self.assertNotIn("helper_pids", line)
+        self.assertNotIn("api_key", line)
+
+
 if __name__ == "__main__":
     unittest.main()
+
