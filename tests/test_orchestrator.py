@@ -12,7 +12,7 @@ import time
 import tempfile
 import unittest
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,6 +22,8 @@ from daily_games.config_manager import CheckResult
 from daily_games.orchestrator import (
     GAME_ORDER,
     DailyOrchestrator,
+    GameResult,
+    RunReport,
     STATE_COMPLETED,
     STATE_FAILED,
     STATE_PAUSED,
@@ -227,6 +229,75 @@ class TransientExitSnapshotMonitor:
         return True
 
 
+class StoppedBarrierMonitor:
+    """启动屏障阶段一律视为无进程；退出屏障阶段按剧本演绎指定结论。
+
+    配合 ``StoppedRunAdapter`` 在 cleanup 时切入 ``exit_phase``，确保两道
+    屏障查询到的是同一张内存进程表，全程不触碰真实进程。
+    """
+
+    def __init__(self, exit_outcome):
+        self.exit_outcome = exit_outcome
+        self.exit_phase = False
+        self.wait_calls: list[int] = []
+        self.unsafe_calls: list[str] = []
+
+    def find_by_executable(self, name):
+        if not self.exit_phase:
+            return []
+        if self.exit_outcome == "query_failed":
+            raise RuntimeError("枚举失败")
+        if self.exit_outcome == "ok":
+            return []
+        return [ProcessRecord(
+            pid=4100,
+            executable=str(name),
+            full_path=f"C:\\fake\\{name}",
+            owned=False,
+            create_time=0.0,
+        )]
+
+    def wait_for_exit(self, pid, timeout_s, stop_event=None):
+        self.wait_calls.append(pid)
+        if self.exit_outcome == "wait_failed":
+            raise RuntimeError("等待失败")
+        return False
+
+    def launch(self, *args, **kwargs):
+        return self._unsafe("launch")
+
+    def take_ownership(self, *args, **kwargs):
+        return self._unsafe("take_ownership")
+
+    def terminate_if_owned(self, *args, **kwargs):
+        return self._unsafe("terminate_if_owned")
+
+    def _unsafe(self, name):
+        self.unsafe_calls.append(name)
+        raise AssertionError(f"停止诊断用例不得调用真实进程操作 {name}")
+
+
+class StoppedRunAdapter(FakeAdapter):
+    """wait_completion 阻塞到停止请求；cleanup 前切入退出屏障剧本。"""
+
+    def __init__(self, monitor, cleanup_outcome=None):
+        outcomes = {"cleanup": [cleanup_outcome]} if cleanup_outcome is not None else None
+        super().__init__(outcomes)
+        self.monitor = monitor
+        self.entered = threading.Event()
+
+    def wait_completion(self, timeout_s, stop_event):
+        self.calls.append("wait_completion")
+        self.wait_completion_args.append((timeout_s, stop_event))
+        self.entered.set()
+        stop_event.wait(2)
+        return Step(False, "stop_requested", "已收到停止请求")
+
+    def cleanup(self):
+        self.monitor.exit_phase = True
+        return super().cleanup()
+
+
 class SequenceAdapter(FakeAdapter):
     def __init__(self, game_id, game_name, helper_name, monitor, trace):
         super().__init__()
@@ -388,6 +459,17 @@ def sequential_config():
         "game_window_s": 1,
         "completion_s": 1,
         "cleanup_s": 1,
+    }
+    return config
+
+
+def stopped_diagnostic_config():
+    """停止诊断用例的配置：带全部进程名，退出屏障窗口很短。"""
+    config = dry_run_config()
+    config["timeouts"] = {
+        "game_window_s": 1,
+        "completion_s": 1,
+        "cleanup_s": 0.2,
     }
     return config
 
@@ -1276,6 +1358,126 @@ class OrchestratorTests(unittest.TestCase):
         result = box["result"].results[0]
         self.assertEqual(result.code, "launch_failed")
         self.assertEqual(result.state, STATE_FAILED)
+
+    def test_stopped_game_result_combines_cleanup_and_exit_barrier_conclusions(self):
+        ok_cleanup = None
+        not_owned_cleanup = Step(False, "not_owned", "清理时进程已不归属本轮")
+        failed_cleanup = Step(False, "cleanup_failed", "无法结束挂机进程")
+        cases = [
+            # (子场景, cleanup 结果, 屏障剧本, 期望 code)
+            ("cleanup_ok_barrier_ok", ok_cleanup, "ok", "stop_requested"),
+            ("not_owned_barrier_ok", not_owned_cleanup, "ok", "not_owned"),
+            ("cleanup_failed_barrier_ok", failed_cleanup, "ok", "cleanup_failed"),
+            ("cleanup_ok_barrier_still_running", ok_cleanup, "still_running", "managed_process_still_running"),
+            ("cleanup_ok_barrier_query_failed", ok_cleanup, "query_failed", "managed_process_query_failed"),
+            ("cleanup_ok_barrier_wait_failed", ok_cleanup, "wait_failed", "managed_process_wait_failed"),
+            ("not_owned_barrier_still_running", not_owned_cleanup, "still_running", "managed_process_still_running"),
+            ("cleanup_failed_barrier_query_failed", failed_cleanup, "query_failed", "managed_process_query_failed"),
+        ]
+        for scenario, cleanup_outcome, barrier_outcome, expected_code in cases:
+            with self.subTest(scenario=scenario):
+                monitor = StoppedBarrierMonitor(barrier_outcome)
+                stopping = StoppedRunAdapter(monitor, cleanup_outcome)
+                adapters = make_adapters(arknights=stopping)
+                orchestrator = DailyOrchestrator(
+                    Path("test-root") / "config" / "user.json",
+                    config_manager=FakeConfigManager(stopped_diagnostic_config()),
+                    process_monitor=monitor,
+                    adapters=adapters,
+                    logger=FakeLogger(),
+                )
+                events = []
+                orchestrator.add_listener(events.append)
+
+                thread, box = run_in_thread(orchestrator.run_all)
+                self.assertTrue(stopping.entered.wait(2))
+                orchestrator.request_stop()
+                thread.join(5)
+                self.assertFalse(thread.is_alive())
+                self.assertNotIn("error", box)
+
+                report = box["result"]
+                self.assertTrue(report.stopped)
+                self.assertFalse(report.ok)
+                self.assertEqual(len(report.results), 1)
+                result = report.results[0]
+                self.assertEqual(result.game_id, "arknights")
+                self.assertEqual(result.state, STATE_STOPPED)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.code, expected_code)
+
+                message = result.message
+                if barrier_outcome == "ok":
+                    if cleanup_outcome is None:
+                        self.assertIn("调度已停止", message)
+                        self.assertIn("均已退出", message)
+                    else:
+                        self.assertIn(f"清理返回 {cleanup_outcome.code}", message)
+                        self.assertIn("屏障确认全部退出", message)
+                        self.assertNotIn("残留", message)
+                elif barrier_outcome == "still_running":
+                    self.assertIn("仍有进程未退出", message)
+                    self.assertIn("本轮游戏或助手尚未退出", message)
+                else:
+                    self.assertIn("无法确认是否全部退出", message)
+                    self.assertNotIn("仍有进程未退出", message)
+                    self.assertNotIn("均已退出", message)
+                if barrier_outcome != "ok" and cleanup_outcome is not None:
+                    self.assertIn(f"清理返回 {cleanup_outcome.code}", message)
+                    self.assertIn(expected_code, message)
+
+                # stopped 事件携带与 GameResult 相同的 code/message。
+                game_stopped_events = [
+                    event for event in events
+                    if event.state == STATE_STOPPED and event.game_id == "arknights"
+                ]
+                self.assertEqual(len(game_stopped_events), 1)
+                self.assertEqual(game_stopped_events[0].error_code, result.code)
+                self.assertEqual(game_stopped_events[0].message, result.message)
+
+                # 停止分支不进入失败暂停，也不启动下一款游戏。
+                self.assertNotIn(STATE_PAUSED, [event.state for event in events])
+                self.assertEqual(adapters["endfield"].calls, [])
+                self.assertEqual(adapters["limbus"].calls, [])
+                # 停止分支只做诊断，不触发任何真实启动或进程操作入口。
+                self.assertEqual(monitor.unsafe_calls, [])
+
+    def test_game_result_has_no_stopped_field_but_run_report_keeps_it(self):
+        self.assertNotIn("stopped", {item.name for item in fields(GameResult)})
+        self.assertIn("stopped", {item.name for item in fields(RunReport)})
+
+    def test_stopped_branch_keeps_earlier_stage_failure_priority(self):
+        for barrier_outcome in ("ok", "still_running", "query_failed"):
+            with self.subTest(barrier=barrier_outcome):
+                monitor = StoppedBarrierMonitor(barrier_outcome)
+                holder: dict[str, object] = {}
+
+                def cleanup_during_stop():
+                    monitor.exit_phase = True
+                    holder["orchestrator"].request_stop()
+                    return Step(False, "cleanup_failed", "无法清理")
+
+                adapter = FakeAdapter({
+                    "start_game": [Step(False, "launch_failed", "无法启动")],
+                    "cleanup": [cleanup_during_stop],
+                })
+                orchestrator = DailyOrchestrator(
+                    Path("test-root") / "config" / "user.json",
+                    config_manager=FakeConfigManager(stopped_diagnostic_config()),
+                    process_monitor=monitor,
+                    adapters=make_adapters(arknights=adapter),
+                    logger=FakeLogger(),
+                )
+                holder["orchestrator"] = orchestrator
+
+                report = orchestrator.run_one("arknights")
+
+                self.assertTrue(report.stopped)
+                result = report.results[0]
+                self.assertEqual(result.state, STATE_FAILED)
+                self.assertEqual(result.code, "launch_failed")
+                self.assertEqual(result.message, "无法启动")
+                self.assertEqual(monitor.unsafe_calls, [])
 
 
 if __name__ == "__main__":

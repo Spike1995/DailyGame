@@ -641,14 +641,7 @@ class DailyOrchestrator:
         if stopped or self._stop_event.is_set():
             if not cleanup.ok:
                 self._log("warning", f"[{game_id}] 停止期间清理失败：{cleanup.code}")
-            result = self._game_result(
-                game_id,
-                STATE_STOPPED,
-                False,
-                "stop_requested",
-                "任务收到安全停止请求。",
-                started_at,
-            )
+            result = self._stopped_game_result(game_id, cleanup, exit_barrier, started_at)
             self._transition(game_id, STATE_STOPPED, result.message, result.code)
             return result
 
@@ -702,6 +695,76 @@ class DailyOrchestrator:
         )
         self._transition(game_id, STATE_COMPLETED, result.message)
         return result
+
+    @staticmethod
+    def _stopped_game_result(
+        game_id: str,
+        cleanup: Any,
+        exit_barrier: Any,
+        started_at: str,
+    ) -> GameResult:
+        """组合停止路径上的清理与退出屏障结论，供 stopped 分支使用。
+
+        ``GameResult`` 没有 stopped 字段；``RunReport.stopped`` 由 ``_run``
+        维护。四种组合里 cleanup 失败与屏障失败的次要结论没有 details
+        可依赖，必须完整写进 message：
+        ① cleanup ok + 屏障 ok → ``stop_requested``；
+        ② cleanup 失败（含 not_owned）+ 屏障 ok → ``cleanup.code``，
+           且不得把屏障已确认退出的结果写成残留；
+        ③ cleanup ok + 屏障失败 → ``exit_barrier.code``，保留屏障原因；
+        ④ 两者均失败 → 以 ``exit_barrier.code`` 为最终安全码，
+           同时列出 cleanup.code 与屏障码/原因。
+        """
+        if exit_barrier.ok:
+            if cleanup.ok:
+                return DailyOrchestrator._game_result(
+                    game_id,
+                    STATE_STOPPED,
+                    False,
+                    "stop_requested",
+                    "调度已停止；本轮游戏与助手均已退出。",
+                    started_at,
+                )
+            return DailyOrchestrator._game_result(
+                game_id,
+                STATE_STOPPED,
+                False,
+                str(cleanup.code),
+                f"调度已停止；清理返回 {cleanup.code}，随后屏障确认全部退出。",
+                started_at,
+            )
+        barrier_conclusion = DailyOrchestrator._stopped_barrier_conclusion(exit_barrier)
+        if cleanup.ok:
+            return DailyOrchestrator._game_result(
+                game_id,
+                STATE_STOPPED,
+                False,
+                str(exit_barrier.code),
+                f"调度已停止；本轮清理已完成，但{barrier_conclusion}",
+                started_at,
+            )
+        return DailyOrchestrator._game_result(
+            game_id,
+            STATE_STOPPED,
+            False,
+            str(exit_barrier.code),
+            f"调度已停止；清理返回 {cleanup.code}；{barrier_conclusion}",
+            started_at,
+        )
+
+    @staticmethod
+    def _stopped_barrier_conclusion(exit_barrier: Any) -> str:
+        """把屏障失败结论转成停止消息里的受限措辞。
+
+        只有 ``managed_process_still_running`` 有枚举证据，允许断言
+        「仍有进程未退出」；查询或等待失败等未知结果只能写
+        「无法确认是否全部退出」，不得断言进程仍在运行或已全部退出。
+        """
+        code = str(getattr(exit_barrier, "code", ""))
+        reason = str(getattr(exit_barrier, "message", "")).strip()
+        if code == "managed_process_still_running":
+            return f"仍有进程未退出（{code}）：{reason}"
+        return f"无法确认是否全部退出（{code}）：{reason}"
 
     def _wait_for_decision(
         self,
