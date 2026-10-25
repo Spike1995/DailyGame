@@ -52,7 +52,9 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SYNCHRONIZE = 0x00100000
 STILL_ACTIVE = 259
 WAIT_OBJECT_0 = 0
+WAIT_TIMEOUT = 0x00000102
 TERMINATE_WAIT_MS = 5_000
+WM_CLOSE = 0x0010
 
 _FILE_MUTATION_RIGHTS = (
     0x00000002,  # FILE_WRITE_DATA
@@ -226,13 +228,21 @@ def _windows_api_error(operation: str) -> OSError:
 
 @dataclass(frozen=True)
 class ProcessRecord:
-    """单一进程的记录。owned=True 表示由本程序启动或明确接管。"""
+    """单一进程的记录。owned=True 表示由本程序启动或明确接管。
+
+    ``native_create_time`` 是 GetProcessTimes 的 64 位 FILETIME 原值
+    （100ns 单位，``(``high<<32)|low``，int），为 owned 身份的唯一依据：
+    接管与终止都必须与之精确相等；取不到时为 0，一律失败关闭。
+    ``create_time``（unix 秒 float）仅作显示与兼容，不得再作为身份等价
+    依据（T-008a #7）。
+    """
 
     pid: int
     executable: str
     full_path: str
     owned: bool
     create_time: float  # unix 时间戳（秒）；无法获取时为 0.0
+    native_create_time: int = 0  # 64 位 FILETIME 原值；0 表示不可信/未知
     extra: Mapping[str, object] = field(default_factory=dict)
 
 
@@ -343,33 +353,58 @@ def _query_full_path(pid: int) -> str:
         kernel32.CloseHandle(handle)
 
 
-def _get_create_time(pid: int) -> float:
-    """获取进程创建时间（unix 秒）。无法获取回 0.0。"""
+def _filetime_to_unix_seconds(file_time: int) -> float:
+    """64 位 FILETIME（100ns，1601 纪元）转 unix 秒；仅作显示/兼容。"""
+    # FILETIME 是 100ns 间隔，自 1601-01-01；减去 1601→1970 的 11644473600 秒。
+    return file_time / 10_000_000.0 - 11644473600.0
+
+
+def _query_process_times_from_handle(kernel32, handle) -> tuple[int, float]:
+    """用已打开的句柄查询 (原生创建 FILETIME int, unix 秒 float)。
+
+    原生标识是 GetProcessTimes 的 64 位 FILETIME 原值 ``(``high<<32)|low``，
+    为 owned 身份的唯一依据；查询失败或取不到正值时返回 (0, 0.0)，
+    调用方必须失败关闭，不得用 time.time 人工补身份（T-008a #7）。
+    """
+    ctime = _FileTime()
+    etime = _FileTime()
+    ktime = _FileTime()
+    utime = _FileTime()
+    ok = kernel32.GetProcessTimes(
+        handle, ctypes.byref(ctime), ctypes.byref(etime),
+        ctypes.byref(ktime), ctypes.byref(utime),
+    )
+    if not ok:
+        return 0, 0.0
+    native = (int(ctime.dwHighDateTime) << 32) | int(ctime.dwLowDateTime)
+    if native <= 0:
+        return 0, 0.0
+    return native, _filetime_to_unix_seconds(native)
+
+
+def _query_process_times_by_pid(pid: int) -> tuple[int, float]:
+    """打开进程一次并查询 (原生创建 FILETIME int, unix 秒 float)。
+
+    失败返回 (0, 0.0)；原生标识为 0 时接管/终止一律失败关闭。
+    """
     if not IS_WINDOWS:
-        return 0.0
+        return 0, 0.0
     kernel32 = _kernel32_process_api()
     if kernel32 is None:
-        return 0.0
+        return 0, 0.0
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
-        return 0.0
+        return 0, 0.0
     try:
-        ctime = _FileTime()
-        etime = _FileTime()
-        ktime = _FileTime()
-        utime = _FileTime()
-        ok = kernel32.GetProcessTimes(
-            handle, ctypes.byref(ctime), ctypes.byref(etime),
-            ctypes.byref(ktime), ctypes.byref(utime),
-        )
-        if not ok:
-            return 0.0
-        # FILETIME 是 100ns 间隔，自 1601-01-01
-        # 转成 unix 秒：减去 11644473600（秒）
-        file_time = (ctime.dwHighDateTime << 32) | ctime.dwLowDateTime
-        return file_time / 10_000_000.0 - 11644473600.0
+        return _query_process_times_from_handle(kernel32, handle)
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _get_create_time(pid: int) -> float:
+    """获取进程创建时间（unix 秒，显示/兼容用）。无法获取回 0.0。"""
+    _native, seconds = _query_process_times_by_pid(pid)
+    return seconds
 
 
 # --------------------------------------------------------------------------- #
@@ -509,9 +544,11 @@ class ProcessMonitor:
             if pid in seen_pids:
                 continue
             if _process_identity_matches(exe, path, target, expected_path):
+                native_create_time, create_time = _query_process_times_by_pid(pid)
                 results.append(ProcessRecord(
                     pid=pid, executable=exe, full_path=path, owned=False,
-                    create_time=_get_create_time(pid),
+                    create_time=create_time,
+                    native_create_time=native_create_time,
                 ))
         return results
 
@@ -561,16 +598,19 @@ class ProcessMonitor:
             close_fds=True,
         )
         pid = int(proc.pid)
-        # 尝试获取完整路径与创建时间
+        # 尝试获取完整路径与原生创建标识/创建时间
         time.sleep(0.05)  # 给操作系统一点时间登录进程
         full_path = _query_full_path(pid) or _exe_from_command(args)
-        create_time = _get_create_time(pid) or time.time()
+        # 原生创建标识是接管/终止的唯一身份依据；取不到时保持 0（后续
+        # 终止失败关闭），绝不用 time.time 人工补身份（T-008a #7）。
+        native_create_time, create_time = _query_process_times_by_pid(pid)
         rec = ProcessRecord(
             pid=pid,
             executable=Path(full_path).name,
             full_path=full_path,
             owned=True,
             create_time=create_time,
+            native_create_time=native_create_time,
             extra={"returncode_attr": None, "argv": list(args)},
         )
         with self._lock:
@@ -717,45 +757,55 @@ class ProcessMonitor:
         *,
         expected_path: str | os.PathLike[str] | None = None,
         expected_create_time: float | None = None,
+        expected_native_create_time: int | None = None,
     ) -> ProcessRecord | None:
         """明确接管一个现有进程，使其可被 terminate_if_owned 结束。
 
-        ``expected_path`` 与 ``expected_create_time`` 用来复核先前快照，降低
-        PID 在查找与接管之间被重用的风险。身份不符或 PID 不存在时返回 None。
+        身份核验（T-008a #7）：
+        - ``expected_path`` 提供时路径必须精确匹配；
+        - 原生 64 位 FILETIME 创建标识在快照枚举后与再次打开后各查询一次，
+          两次必须逐位相等（防御枚举与登记之间的 PID 复用）；
+        - ``expected_native_create_time`` 提供时还须与之精确相等。
+        ``expected_create_time``（float）仅为兼容旧调用保留，**不再作为
+        身份等价依据**（相差 <10ms 的不同实例可能得到相同 float）；调用方
+        应改传 ``expected_native_create_time``（快照记录现已携带
+        ``native_create_time``）。任一原生标识取不到或不相等一律拒绝，
+        绝不以 time.time 补齐。
         """
         for p in _snapshot_processes():
-            if int(p["pid"]) == pid:
-                executable = str(p["exe"])
-                full_path = str(p["path"])
-                if expected_path is not None and not _process_identity_matches(
-                    executable,
-                    full_path,
-                    Path(os.fspath(expected_path)).name,
-                    expected_path,
-                ):
-                    return None
-                create_time = _get_create_time(pid)
-                if expected_create_time is not None:
-                    try:
-                        expected_time = float(expected_create_time)
-                    except (TypeError, ValueError):
-                        return None
-                    if (
-                        expected_time <= 0.0
-                        or create_time <= 0.0
-                        or abs(create_time - expected_time) > 0.01
-                    ):
-                        return None
-                rec = ProcessRecord(
-                    pid=pid,
-                    executable=executable,
-                    full_path=full_path,
-                    owned=True,
-                    create_time=create_time or time.time(),
-                )
-                with self._lock:
-                    self._owned[pid] = rec
-                return rec
+            if int(p["pid"]) != pid:
+                continue
+            executable = str(p["exe"])
+            full_path = str(p["path"])
+            if expected_path is not None and not _process_identity_matches(
+                executable,
+                full_path,
+                Path(os.fspath(expected_path)).name,
+                expected_path,
+            ):
+                return None
+            native_first, _seconds_first = _query_process_times_by_pid(pid)
+            if native_first == 0:
+                return None
+            native_create_time, create_time = _query_process_times_by_pid(pid)
+            if native_create_time == 0 or native_create_time != native_first:
+                return None
+            if (
+                expected_native_create_time is not None
+                and native_create_time != expected_native_create_time
+            ):
+                return None
+            rec = ProcessRecord(
+                pid=pid,
+                executable=executable,
+                full_path=full_path,
+                owned=True,
+                create_time=create_time,
+                native_create_time=native_create_time,
+            )
+            with self._lock:
+                self._owned[pid] = rec
+            return rec
         return None
 
     # ------------------------------------------------------------------ #
@@ -830,19 +880,35 @@ class ProcessMonitor:
     def terminate_if_owned(self, pid: int, grace_s: float = 5.0) -> bool:
         """只结束 owned 进程。非 owned 回 False 且不执行任何动作。
 
-        先尝试优雅关闭（WM_CLOSE / TerminateProcess）， grace_s 后仍在则强制结束。
+        Windows 上只 OpenProcess 一次：身份核验（路径/原生创建标识/存活）、
+        逐窗口 WM_CLOSE、宽限等待与强制结束都复用同一内核对象句柄，每个
+        分支在 ``finally`` 中恰好关闭一次；身份不明或原进程已退出时放弃
+        破坏动作（T-008a #7）。非 Windows 保留 SIGTERM 降级路径。
         """
         with self._lock:
             rec = self._owned.get(pid)
         if rec is None or not rec.owned:
             return False
-        ok = _terminate_pid(pid, grace_s)
+        if IS_WINDOWS:
+            if rec.native_create_time == 0:
+                # 缺可信原生标识：绝不终止；若进程已退出则仅回收记录。
+                if self._owned_process_has_exited(pid):
+                    return self._forget_owned(pid, reap_timeout_s=0.5)
+                return False
+            ok = _terminate_owned_record(rec, grace_s)
+        else:
+            try:
+                import signal
+                os.kill(pid, signal.SIGTERM)
+                ok = True
+            except (OSError, ProcessLookupError):
+                ok = False
         if ok:
             return self._forget_owned(
                 pid,
                 reap_timeout_s=max(1.0, min(5.0, float(grace_s))),
             )
-        # 进程可能恰好在宽限期边界自行退出，使 TerminateProcess 回报失败。
+        # 进程可能恰好在宽限期边界自行退出，使终止回报失败。
         # 对本程序启动的子进程再做一次有界 wait，确认退出后仍应回收句柄。
         with self._lock:
             child = self._children.get(pid)
@@ -1324,66 +1390,107 @@ def _run_schtasks(
         )
 
 
-def _terminate_pid(pid: int, grace_s: float) -> bool:
-    """向 pid 发送正常关闭信号；经过 grace_s 后仍在运行则调用 TerminateProcess。"""
-    if not IS_WINDOWS:
-        try:
-            import signal
-            os.kill(pid, signal.SIGTERM)
-            return True
-        except (OSError, ProcessLookupError):
-            return False
+def _terminate_owned_record(rec: ProcessRecord, grace_s: float) -> bool:
+    """终止一个已通过 owned 记录绑定的进程（仅 Windows）。
 
-    user32 = _user32_window_api()
+    只 OpenProcess 一次（查询/终止/同步权限），随后路径、原生创建标识、
+    存活查询、逐窗口 WM_CLOSE 门控、宽限等待与强制结束全部复用这一内核
+    对象句柄，``finally`` 中恰好关闭一次；绝不按 PID 第二次打开目标。
+    路径与原生标识须与 owned 记录精确相等且原进程仍存活，否则立即放弃，
+    不发 WM_CLOSE、不 TerminateProcess，因此 PID 复用后的新实例永远不会
+    被选中（T-008a #7）。返回 True 表示已确认退出或已强制结束。
+    """
+    if not IS_WINDOWS:
+        return False
     kernel32 = _kernel32_process_api()
     if kernel32 is None:
         return False
 
-    # 1. 对所有属于 pid 的可见窗口送 WM_CLOSE
-    WM_CLOSE = 0x0010
-
-    @_WindowEnumProc
-    def close_proc(hwnd: int, lparam: int) -> int:
-        wpid = ctypes.c_uint32()
-        if user32 is not None:
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
-            if int(wpid.value) == pid and user32.IsWindowVisible(hwnd):
-                user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
-        return 1
-
-    if user32 is not None:
-        user32.EnumWindows(close_proc, 0)
-
-    # 2. 等待 grace_s
-    deadline = time.monotonic() + max(0.0, grace_s)
-    while time.monotonic() < deadline:
-        ctypes.set_last_error(0)
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            if ctypes.get_last_error() == ERROR_INVALID_PARAMETER:
-                return True
-            time.sleep(0.2)
-            continue
+    def _exit_code() -> int | None:
+        """同一句柄查询退出码；查询失败返回 None（调用方失败关闭）。"""
         exit_code = ctypes.c_uint32()
-        got = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
-        kernel32.CloseHandle(handle)
-        if got and exit_code.value != STILL_ACTIVE:
-            return True
-        time.sleep(0.2)
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return None
+        return int(exit_code.value)
 
-    # 3. 强制结束
     ctypes.set_last_error(0)
     handle = kernel32.OpenProcess(
-        PROCESS_TERMINATE | SYNCHRONIZE,
+        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE,
         False,
-        pid,
+        rec.pid,
     )
     if not handle:
+        # PID 无效说明原进程已退出；其他错误（如拒绝访问）失败关闭。
         return ctypes.get_last_error() == ERROR_INVALID_PARAMETER
     try:
+        path_buffer = ctypes.create_unicode_buffer(32768)
+        path_size = ctypes.c_uint32(len(path_buffer))
+        if not kernel32.QueryFullProcessImageNameW(
+            handle, 0, path_buffer, ctypes.byref(path_size),
+        ):
+            return False
+        if not _same_path(path_buffer.value, rec.full_path):
+            return False
+        native_create_time, _seconds = _query_process_times_from_handle(
+            kernel32, handle,
+        )
+        if native_create_time == 0 or native_create_time != rec.native_create_time:
+            return False
+
+        exit_code_value = _exit_code()
+        if exit_code_value is None:
+            return False
+        if exit_code_value != STILL_ACTIVE:
+            # 原进程已退出：没有需要终止的对象。
+            return True
+
+        # 优雅关闭：只向逐个重新核验过的具体 HWND 发送，不做 PID 广播；
+        # 任一门控失败或原进程已退出就停止发送，转入同句柄等待。
+        user32 = _user32_window_api()
+        if user32 is not None:
+            try:
+                windows = _enum_windows_for_pid(rec.pid)
+            except OSError:
+                windows = []
+            for window in windows:
+                hwnd = window["hwnd"]
+                if not user32.IsWindowVisible(hwnd):
+                    break
+                window_pid = ctypes.c_uint32()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
+                if int(window_pid.value) != rec.pid:
+                    break
+                exit_code_value = _exit_code()
+                if exit_code_value is None or exit_code_value != STILL_ACTIVE:
+                    break
+                user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+
+        # 宽限期：同一句柄分段等待；原进程退出即返回，不触碰复用 PID 的新实例。
+        deadline = time.monotonic() + max(0.0, grace_s)
+        while True:
+            exit_code_value = _exit_code()
+            if exit_code_value is None:
+                return False
+            if exit_code_value != STILL_ACTIVE:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            wait_ms = int(min(0.2, remaining) * 1000)
+            if kernel32.WaitForSingleObject(handle, wait_ms) == WAIT_OBJECT_0:
+                return True
+
+        # 宽限到期：只对最初已核验的句柄强制结束，并用同一句柄等待退出。
+        ctypes.set_last_error(0)
         terminated = bool(kernel32.TerminateProcess(handle, 1))
-        wait_ms = TERMINATE_WAIT_MS if terminated else 0
-        return kernel32.WaitForSingleObject(handle, wait_ms) == WAIT_OBJECT_0
+        if not terminated:
+            # 可能恰好在宽限期边界自行退出；查询失败仍失败关闭。
+            exit_code_value = _exit_code()
+            return (
+                exit_code_value is not None
+                and exit_code_value != STILL_ACTIVE
+            )
+        return kernel32.WaitForSingleObject(handle, TERMINATE_WAIT_MS) == WAIT_OBJECT_0
     finally:
         kernel32.CloseHandle(handle)
 
