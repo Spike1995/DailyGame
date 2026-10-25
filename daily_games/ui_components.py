@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -46,6 +47,9 @@ ACTIVE_STATES = frozenset({
     "checking", "starting_game", "waiting_game", "starting_helper",
     "running", "cleaning", "stopping",
 })
+
+#: 单款游戏本轮尝试结束的状态；计时在此冻结。
+FINISHED_STATES = frozenset({"completed", "failed", "skipped", "stopped"})
 
 #: 关闭窗口的三种分支。
 CLOSE_KEEP = "keep"
@@ -94,15 +98,43 @@ def control_states(is_running: bool, current_state: str) -> dict[str, bool]:
 # 显示格式化
 # ---------------------------------------------------------------------------
 
+def format_event_time(timestamp: str) -> str:
+    """把带时区的 ISO 时间戳转为本地 HH:MM:SS；无法解析时原样返回。"""
+    try:
+        moment = datetime.fromisoformat(timestamp)
+    except (TypeError, ValueError):
+        return str(timestamp)
+    if moment.tzinfo is not None:
+        moment = moment.astimezone()
+    return moment.strftime("%H:%M:%S")
+
+
 def format_event(event) -> str:
     """把 StatusEvent 格式化为事件记录区的一行文本。"""
     line = (
-        f"[{event.timestamp}] {game_name(event.game_id)}"
+        f"[{format_event_time(event.timestamp)}] {game_name(event.game_id)}"
         f"／{state_label(event.state)}：{event.message}"
     )
     if event.error_code:
         line += f"（错误码 {event.error_code}）"
     return line
+
+
+def format_duration(seconds: float) -> str:
+    """把秒数格式化为 H:MM:SS；负数按 0 处理。"""
+    total = max(0, int(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}"
+
+
+def card_elapsed_text(card, now: float) -> str:
+    """卡片计时文本：进行中为「已运行」，结束后为「用时」，未开始为空。"""
+    if card.started_at is None:
+        return ""
+    if card.finished_at is not None:
+        return f"用时 {format_duration(card.finished_at - card.started_at)}"
+    return f"已运行 {format_duration(now - card.started_at)}"
 
 
 def format_check_result(result) -> str:
@@ -156,6 +188,9 @@ class CardState:
     state: str = "idle"
     message: str = ""
     error_code: str | None = None
+    #: time.monotonic() 时刻；本轮尝试从进入 checking 起算。
+    started_at: float | None = None
+    finished_at: float | None = None
 
 
 @dataclass
@@ -202,6 +237,7 @@ class UiController:
         self.cards = {gid: CardState(game_id=gid) for gid in GAME_ORDER}
         self.last_state = "idle"
         self._bg = bg
+        self._run_submitted = False
 
     # -- 事件通道 ---------------------------------------------------------
 
@@ -219,10 +255,21 @@ class UiController:
                 break
         return items
 
-    def apply_event(self, event) -> None:
-        """把事件归并到对应游戏卡片；系统事件只更新整体状态。"""
+    def apply_event(self, event, now: float | None = None) -> None:
+        """把事件归并到对应游戏卡片；系统事件只更新整体状态。
+
+        从非进行中状态进入 checking 视为新一轮尝试（含重试），重新计时；
+        进入 FINISHED_STATES 时冻结计时。
+        """
+        now = time.monotonic() if now is None else now
         card = self.cards.get(event.game_id)
         if card is not None:
+            if event.state == "checking" and card.state not in ACTIVE_STATES:
+                card.started_at = now
+                card.finished_at = None
+            elif (event.state in FINISHED_STATES
+                  and card.started_at is not None and card.finished_at is None):
+                card.finished_at = now
             card.state = event.state
             card.message = event.message
             card.error_code = event.error_code
@@ -252,20 +299,32 @@ class UiController:
 
     # -- 启动入口 ---------------------------------------------------------
 
-    def request_start_all(self) -> bool:
-        """执行中拒绝第二次启动，返回 False。"""
-        if self.orchestrator.is_running:
+    def _submit_run(self, fn) -> bool:
+        """提交一次运行；已提交但工作线程尚未进入编排器时同样拒绝。
+
+        仅由 Tk 主线程调用；标志在工作结束（含异常）时于背景线程清除。
+        """
+        if self._run_submitted or self.orchestrator.is_running:
             return False
-        self.run_blocking(self.orchestrator.run_all)
+        self._run_submitted = True
+
+        def job():
+            try:
+                return fn()
+            finally:
+                self._run_submitted = False
+
+        self.run_blocking(job)
         return True
+
+    def request_start_all(self) -> bool:
+        """执行中或已提交未开始时拒绝第二次启动，返回 False。"""
+        return self._submit_run(self.orchestrator.run_all)
 
     def request_run_one(self, game_id: str) -> bool:
         if game_id not in GAME_ORDER:
             raise ValueError(f"未知的游戏 ID：{game_id}")
-        if self.orchestrator.is_running:
-            return False
-        self.run_blocking(lambda: self.orchestrator.run_one(game_id))
-        return True
+        return self._submit_run(lambda: self.orchestrator.run_one(game_id))
 
     # -- 执行中控制（主线程可安全调用） ---------------------------------
 

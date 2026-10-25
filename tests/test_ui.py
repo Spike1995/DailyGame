@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -24,7 +25,9 @@ from daily_games.ui_components import (  # noqa: E402
     GAME_ORDER,
     STATE_LABELS,
     UiController,
+    card_elapsed_text,
     control_states,
+    format_duration,
     format_event,
     selectable_change_ids,
     state_label,
@@ -288,6 +291,16 @@ class StateDisplayTests(unittest.TestCase):
         self.assertIn("失败", line)
         self.assertIn("TIMEOUT", line)
 
+    def test_format_event_shows_local_clock_time(self):
+        stamp = "2026-08-09T06:00:00+00:00"
+        expected = datetime.fromisoformat(stamp).astimezone().strftime("%H:%M:%S")
+        line = format_event(make_event(timestamp=stamp))
+        self.assertTrue(line.startswith(f"[{expected}] "), line)
+
+    def test_format_event_keeps_unparseable_timestamp(self):
+        line = format_event(make_event(timestamp="not-a-time"))
+        self.assertTrue(line.startswith("[not-a-time] "), line)
+
 
 class ControlStateTests(unittest.TestCase):
     def test_idle_allows_start_only(self):
@@ -358,6 +371,30 @@ class StartGuardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             controller.request_run_one("star_rail")
 
+    def test_double_click_before_worker_starts_submits_once(self):
+        # 背景替身先不执行：模拟工作线程尚未进入 _begin_run 的窗口。
+        pending = []
+        orch = FakeOrchestrator()
+        controller = UiController(orch, bg=lambda fn, cb: pending.append(fn))
+        self.assertTrue(controller.request_start_all())
+        self.assertFalse(controller.request_start_all())
+        self.assertFalse(controller.request_run_one("limbus"))
+        self.assertEqual(len(pending), 1)
+        pending[0]()
+        self.assertEqual(orch.calls, ["run_all"])
+        self.assertTrue(controller.request_run_one("limbus"))
+        self.assertEqual(len(pending), 2)
+
+    def test_failed_run_releases_start_guard(self):
+        pending = []
+        orch = FakeOrchestrator()
+        orch.run_all = mock.Mock(side_effect=RuntimeError("boom"))
+        controller = UiController(orch, bg=lambda fn, cb: pending.append(fn))
+        self.assertTrue(controller.request_start_all())
+        with self.assertRaises(RuntimeError):
+            pending[0]()
+        self.assertTrue(controller.request_start_all())
+
 
 class EventQueueTests(unittest.TestCase):
     def test_listener_from_background_thread_goes_through_queue(self):
@@ -383,6 +420,43 @@ class EventQueueTests(unittest.TestCase):
         for card in controller.cards.values():
             self.assertEqual(card.state, "idle")
         self.assertEqual(controller.last_state, "running")
+
+    def _feed(self, controller, game_id, states_at):
+        for state, now in states_at:
+            controller.apply_event(
+                make_event(game_id=game_id, state=state, message=""), now=now
+            )
+        return controller.cards[game_id]
+
+    def test_elapsed_counts_from_checking_while_active(self):
+        controller = UiController(FakeOrchestrator())
+        card = self._feed(controller, "limbus", [
+            ("checking", 100.0), ("checking", 101.0), ("running", 110.0),
+        ])
+        self.assertEqual(card_elapsed_text(card, 100.0 + 3725), "已运行 1:02:05")
+
+    def test_elapsed_freezes_when_finished(self):
+        controller = UiController(FakeOrchestrator())
+        card = self._feed(controller, "arknights", [
+            ("checking", 0.0), ("running", 5.0), ("completed", 2290.0),
+        ])
+        self.assertEqual(card_elapsed_text(card, 99999.0), "用时 0:38:10")
+
+    def test_retry_after_failure_restarts_timer(self):
+        controller = UiController(FakeOrchestrator())
+        card = self._feed(controller, "endfield", [
+            ("checking", 0.0), ("failed", 60.0), ("paused", 61.0),
+            ("checking", 500.0), ("running", 510.0),
+        ])
+        self.assertEqual(card_elapsed_text(card, 530.0), "已运行 0:00:30")
+
+    def test_idle_card_has_no_elapsed_text(self):
+        controller = UiController(FakeOrchestrator())
+        self.assertEqual(card_elapsed_text(controller.cards["limbus"], 5.0), "")
+
+    def test_format_duration_clamps_negative(self):
+        self.assertEqual(format_duration(-3), "0:00:00")
+        self.assertEqual(format_duration(10800), "3:00:00")
 
     def test_background_exception_becomes_visible_error_event(self):
         def boom():
@@ -529,6 +603,45 @@ class CloseWindowTests(unittest.TestCase):
         controller = UiController(FakeOrchestrator())
         with self.assertRaises(ValueError):
             controller.handle_close_choice("kill")
+
+
+class RunFinishedControlRefreshTests(unittest.TestCase):
+    """编排器结束时只清 is_running、不发事件；轮询必须补刷按钮。"""
+
+    def make_app(self, orchestrator):
+        app = DailyGamesApp.__new__(DailyGamesApp)
+        app.orchestrator = orchestrator
+        app._last_seen_running = False
+        for name in ("btn_start_all", "btn_retry", "btn_skip", "btn_stop",
+                     "btn_check", "btn_restore"):
+            setattr(app, name, FakeCloseWidget())
+        app.btn_run_one = {gid: FakeCloseWidget() for gid in GAME_ORDER}
+        return app
+
+    def test_buttons_restore_after_run_flag_clears_without_event(self):
+        orch = FakeOrchestrator()
+        orch.is_running = True
+        orch.current_state = "paused"
+        app = self.make_app(orch)
+        app._refresh_controls()
+        self.assertEqual(app.btn_start_all.state_calls[-1], ["disabled"])
+
+        # 暂停 300s 自动停止后：编排器 finally 清标志，没有新事件。
+        orch.is_running = False
+        orch.current_state = "stopped"
+        app._refresh_controls_if_run_flag_changed()
+
+        self.assertEqual(app.btn_start_all.state_calls[-1], ["!disabled"])
+        self.assertEqual(app.btn_check.state_calls[-1], ["!disabled"])
+        self.assertEqual(app.btn_stop.state_calls[-1], ["disabled"])
+        for btn in app.btn_run_one.values():
+            self.assertEqual(btn.state_calls[-1], ["!disabled"])
+
+    def test_no_redundant_refresh_while_flag_unchanged(self):
+        orch = FakeOrchestrator()
+        app = self.make_app(orch)
+        app._refresh_controls_if_run_flag_changed()
+        self.assertEqual(app.btn_start_all.state_calls, [])
 
 
 class StopThenExitTests(unittest.TestCase):

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
@@ -21,6 +22,7 @@ from daily_games.ui_components import (
     GAME_ORDER,
     ATTENTION_STATES,
     UiController,
+    card_elapsed_text,
     control_states,
     format_backup,
     format_change,
@@ -96,7 +98,7 @@ COLORS = {
     "success": "#3ED3A0",
     "warning": "#F4C763",
     "danger": "#F27E7E",
-    "disabled": "#39445A",
+    "disabled": "#606B80",
 }
 
 GAME_APPEARANCE = {
@@ -120,7 +122,7 @@ GAME_APPEARANCE = {
     },
     "limbus": {
         "index": "03",
-        "latin_name": "LIMBUS COMPANY",
+        "latin_name": "LIMBUS",
         "short_name": "边狱巴士",
         "helper": "AALC",
         "accent": "#E78150",
@@ -518,6 +520,9 @@ class DailyGamesApp:
 
         self._card_msg_vars = {}
         self._card_err_vars = {}
+        self._card_elapsed_vars = {}
+        self._log_placeholder = False
+        self._last_seen_running = False
         self._card_frames = {}
         self._card_state_pills = {}
         self._stepper_items = {}
@@ -755,7 +760,7 @@ class DailyGamesApp:
         hero = RoundedPanel(
             main, radius=16, background=COLORS["surface"],
             border=COLORS["border_soft"], padding=18,
-            parent_background=content_bg, decorate=self._decorate_hero,
+            parent_background=content_bg,
         )
         hero.pack(fill=tk.X, padx=28)
         hero_inner = hero.content
@@ -858,6 +863,15 @@ class DailyGamesApp:
         self.log_text.tag_configure("success", foreground=COLORS["success"])
         self.log_text.tag_configure("warning", foreground=COLORS["warning"])
         self.log_text.tag_configure("error", foreground=COLORS["danger"])
+        self.log_text.tag_configure(
+            "placeholder", foreground=COLORS["text_subtle"],
+        )
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(
+            tk.END, "暂无事件。开始执行后，各阶段进度会显示在这里。", "placeholder",
+        )
+        self.log_text.configure(state=tk.DISABLED)
+        self._log_placeholder = True
         scrollbar = ttk.Scrollbar(
             log_body, command=self.log_text.yview,
             style="Minimal.Vertical.TScrollbar",
@@ -866,15 +880,6 @@ class DailyGamesApp:
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         log_panel.fit()
-
-    @staticmethod
-    def _decorate_hero(canvas, width, height):
-        """主操作带的柔和光晕；全部位于圆角区域内部，避免压到边角。"""
-        glow = _hex_mix(COLORS["primary"], COLORS["surface"], 0.94)
-        canvas.create_oval(
-            width - 400, height // 2 - 80, width - 80, height // 2 + 80,
-            fill=glow, outline="", tags="panel",
-        )
 
     def _build_sidebar(self, shell):
         sidebar = tk.Frame(shell, background=COLORS["background"], width=252)
@@ -969,7 +974,7 @@ class DailyGamesApp:
 
         self._stepper_icons = {}
         self._stepper_items = {}
-        row_height = 62
+        row_height = 68
         canvas = tk.Canvas(
             sidebar, width=208, height=row_height * len(GAME_ORDER) + 4,
             background=COLORS["background"], highlightthickness=0, bd=0,
@@ -997,13 +1002,13 @@ class DailyGamesApp:
                 canvas.create_image(52, y, image=icon)
                 text_x = 74
             canvas.create_text(
-                text_x, y - 10, anchor="w",
+                text_x, y - 12, anchor="w",
                 text=GAME_APPEARANCE[game_id]["short_name"],
                 fill=COLORS["text"],
                 font=("Microsoft YaHei UI", 10, "bold"),
             )
             state_item = canvas.create_text(
-                text_x, y + 11, anchor="w", text=state_label("idle"),
+                text_x, y + 13, anchor="w", text=state_label("idle"),
                 fill=STATE_COLORS["idle"], font=("Microsoft YaHei UI", 9),
             )
             self._stepper_items[game_id] = (dot, state_item)
@@ -1046,29 +1051,32 @@ class DailyGamesApp:
                 font=("Segoe UI", 11, "bold"),
             )
 
-        name_block = tk.Frame(top, background=COLORS["surface"])
-        name_block.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        tk.Label(
-            name_block, text=GAME_NAMES[game_id], background=COLORS["surface"],
-            foreground=COLORS["text"], anchor=tk.W,
-            font=("Microsoft YaHei UI", 12, "bold"),
-        ).pack(fill=tk.X)
-        tk.Label(
-            name_block,
-            text=f"{meta['latin_name']}  ·  {meta['helper']}",
-            background=COLORS["surface"], foreground=COLORS["text_subtle"],
-            anchor=tk.W, font=("Segoe UI", 8, "bold"),
-        ).pack(fill=tk.X, pady=(4, 0))
+        # 序号先占右侧，标题再分剩余宽度，长标题不会把序号挤出卡片。
         tk.Label(
             top, text=meta["index"], background=COLORS["surface"],
             foreground=meta["accent"], font=("Cascadia Mono", 10, "bold"),
-        ).pack(side=tk.RIGHT, anchor=tk.N)
+        ).pack(side=tk.RIGHT, anchor=tk.N, padx=(8, 0))
+        name_block = tk.Frame(top, background=COLORS["surface"])
+        name_block.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(
+            name_block, text=meta["short_name"], background=COLORS["surface"],
+            foreground=COLORS["text"], anchor=tk.W,
+            font=("Microsoft YaHei UI", 12, "bold"),
+        ).pack(fill=tk.X)
+        # 单行副标题；7 号字保证最小窗口 + 150% 缩放下不被裁切也不撑高卡片。
+        tk.Label(
+            name_block,
+            text=f"{meta['latin_name']} · {meta['helper']}",
+            background=COLORS["surface"], foreground=COLORS["text_subtle"],
+            anchor=tk.W, font=("Segoe UI", 7, "bold"),
+        ).pack(fill=tk.X, pady=(4, 0))
 
         tk.Frame(body, height=1, background=COLORS["border_soft"]).pack(
             fill=tk.X, pady=(14, 12)
         )
-        msg_var = tk.StringVar(value="最近讯息：—")
+        msg_var = tk.StringVar(value="最近消息：—")
         err_var = tk.StringVar(value="")
+        elapsed_var = tk.StringVar(value="")
 
         pill = StatusPill(
             body, tint_base=COLORS["surface"],
@@ -1076,19 +1084,34 @@ class DailyGamesApp:
         )
         pill.set(state_label("idle"), STATE_COLORS["idle"])
         pill.pack(anchor=tk.W)
+        # 计时单独一行：长状态名在最小窗口与 150% 缩放下也不会挤掉计时。
+        tk.Label(
+            body, textvariable=elapsed_var, anchor=tk.W,
+            background=COLORS["surface"], foreground=COLORS["text_muted"],
+            font=("Cascadia Mono", 9),
+        ).pack(fill=tk.X, pady=(6, 0))
 
-        tk.Label(
+        msg_label = tk.Label(
             body, textvariable=msg_var, wraplength=290, justify=tk.LEFT,
-            anchor=tk.W, background=COLORS["surface"],
-            foreground=COLORS["text_muted"], height=2,
+            anchor=tk.NW, background=COLORS["surface"],
+            foreground=COLORS["text_muted"], height=3,
             font=("Microsoft YaHei UI", 9),
-        ).pack(fill=tk.X, pady=(11, 0))
-        tk.Label(
+        )
+        msg_label.pack(fill=tk.X, pady=(11, 0))
+        err_label = tk.Label(
             body, textvariable=err_var, wraplength=290, justify=tk.LEFT,
             anchor=tk.W, background=COLORS["surface"],
-            foreground=COLORS["danger"], height=1,
+            foreground=COLORS["danger"], height=2,
             font=("Cascadia Mono", 8, "bold"),
-        ).pack(fill=tk.X, pady=(3, 10))
+        )
+        err_label.pack(fill=tk.X, pady=(3, 8))
+
+        def _rewrap(event, labels=(msg_label, err_label)):
+            # 换行宽度跟随卡片实际宽度，避免高 DPI 下文字被裁切。
+            for label in labels:
+                label.configure(wraplength=max(120, event.width - 4))
+
+        body.bind("<Configure>", _rewrap, add="+")
         btn = FlatButton(
             body, "仅运行此游戏",
             lambda gid=game_id: self._on_run_one(gid),
@@ -1101,6 +1124,7 @@ class DailyGamesApp:
         self._card_state_pills[game_id] = pill
         self._card_msg_vars[game_id] = msg_var
         self._card_err_vars[game_id] = err_var
+        self._card_elapsed_vars[game_id] = elapsed_var
         self.btn_run_one[game_id] = btn
         panel.fit()
 
@@ -1132,6 +1156,8 @@ class DailyGamesApp:
             elif kind == "callback":
                 item[1](item[2])
         self._refresh_status()
+        self._refresh_elapsed()
+        self._refresh_controls_if_run_flag_changed()
 
         if self._exit_when_stopped and self._stop_finished():
             self._cancel_stop_exit_wait()
@@ -1145,7 +1171,7 @@ class DailyGamesApp:
         card = self.controller.cards.get(event.game_id)
         if card is not None:
             self._card_msg_vars[event.game_id].set(
-                f"最近讯息：{card.message or '—'}"
+                f"最近消息：{card.message or '—'}"
             )
             if card.state in ATTENTION_STATES and card.error_code:
                 self._card_err_vars[event.game_id].set(
@@ -1167,6 +1193,9 @@ class DailyGamesApp:
         else:
             tag = "normal"
         self.log_text.configure(state=tk.NORMAL)
+        if self._log_placeholder:
+            self.log_text.delete("1.0", tk.END)
+            self._log_placeholder = False
         self.log_text.insert(tk.END, line + "\n", tag)
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
@@ -1185,14 +1214,31 @@ class DailyGamesApp:
         color = STATE_COLORS.get(current_state, COLORS["text_muted"])
         self._overall_pill.set(state_text, color)
 
+    def _refresh_elapsed(self):
+        now = time.monotonic()
+        for game_id, var in self._card_elapsed_vars.items():
+            card = self.controller.cards.get(game_id)
+            text = card_elapsed_text(card, now) if card is not None else ""
+            if var.get() != text:
+                var.set(text)
+
+    def _refresh_controls_if_run_flag_changed(self):
+        """队列结束时编排器只清除 is_running、不再发事件，需由轮询补刷按钮。"""
+        try:
+            running = bool(self.orchestrator.is_running)
+        except Exception:  # noqa: BLE001 - _refresh_controls 会记录同类错误
+            return
+        if running != self._last_seen_running:
+            self._refresh_controls()
+
     def _refresh_controls(self):
         try:
-            states = control_states(
-                self.orchestrator.is_running, self.orchestrator.current_state
-            )
+            running = bool(self.orchestrator.is_running)
+            states = control_states(running, self.orchestrator.current_state)
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"更新控件状态失败：{exc!r}")
             return
+        self._last_seen_running = running
 
         def set_state(widget, enabled):
             widget.state(["!disabled"] if enabled else ["disabled"])
