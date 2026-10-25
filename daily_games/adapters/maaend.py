@@ -43,6 +43,10 @@ _TASK_EVENT_RE = re.compile(
 )
 _ABORT_NODE_EVENT_RE = re.compile(r"\[msg=Node\.[A-Za-z]+\.(?:Starting|Succeeded|Failed)\]")
 
+# 失败项名称展示：只列前 3 个 entry 名，长名单交给日志。
+_FAILED_ENTRY_SUMMARY_LIMIT = 3
+_FAILED_ENTRY_NAME_MAX_CHARS = 40
+
 
 class MaaEndAdapter(AdapterBase):
     """明日方舟：终末地 → MaaEnd 适配器。"""
@@ -760,7 +764,10 @@ class MaaEndAdapter(AdapterBase):
             return StepResult(
                 True,
                 CODE_TASK_COMPLETED_WITH_FAILURES,
-                f"MaaEnd 已执行全部启用任务，其中 {len(failed)} 项失败",
+                (
+                    f"MaaEnd 已执行全部启用任务，其中 {len(failed)} 项失败："
+                    f"{_describe_failed_entries(failed.values())}"
+                ),
                 details,
             )
         return StepResult(
@@ -769,6 +776,34 @@ class MaaEndAdapter(AdapterBase):
             "MaaEnd 全部启用任务均有成功证据并已自动退出",
             details,
         )
+
+
+def _describe_failed_entries(entries) -> str:
+    """把失败 entry 名拼成受控摘要：去重、截断单个名称、超限只列前三。
+
+    只显示 MaaEnd 日志里的原始 entry 名，不做中文映射猜测；完整列表仍在
+    ``StepResult.details["failed_entries"]`` 中。
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        name = str(entry).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    shown = [
+        (
+            name
+            if len(name) <= _FAILED_ENTRY_NAME_MAX_CHARS
+            else name[: _FAILED_ENTRY_NAME_MAX_CHARS - 1] + "…"
+        )
+        for name in names[:_FAILED_ENTRY_SUMMARY_LIMIT]
+    ]
+    summary = "、".join(shown)
+    if len(names) > _FAILED_ENTRY_SUMMARY_LIMIT:
+        summary = f"{summary}，等 {len(names)} 项，其余见日志"
+    return summary
 
 
 def _stop_requested(stop_event: object | None) -> bool:
