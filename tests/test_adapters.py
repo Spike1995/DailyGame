@@ -49,6 +49,8 @@ class FakeProcessMonitor:
         self.launch_calls: list[tuple[list[str], str | None]] = []
         self.claimed: list[int] = []
         self.claim_calls: list[tuple[int, str | None, float | None]] = []
+        self.native_claim_calls: list[tuple[int, str | None, int | None]] = []
+        self.take_ownership_result = True
         self.scheduled_task_matches_result = True
         self.start_scheduled_task_result = True
         self.stop_scheduled_task_result = True
@@ -101,8 +103,14 @@ class FakeProcessMonitor:
         *,
         expected_path: str | None = None,
         expected_create_time: float | None = None,
+        expected_native_create_time: int | None = None,
     ) -> ProcessRecord | None:
         self.claim_calls.append((pid, expected_path, expected_create_time))
+        self.native_claim_calls.append(
+            (pid, expected_path, expected_native_create_time)
+        )
+        if not self.take_ownership_result:
+            return None
         records = [
             record
             for values in [
@@ -122,6 +130,7 @@ class FakeProcessMonitor:
             full_path=source.full_path,
             owned=True,
             create_time=source.create_time,
+            native_create_time=source.native_create_time,
         )
         self._owned.add(pid)
         self.claimed.append(pid)
@@ -544,6 +553,7 @@ class TestMaaAdapter(unittest.TestCase):
                 full_path=cfg["game_executable"],
                 owned=False,
                 create_time=0.0,
+                native_create_time=(1234 << 32) | 7,
             )])
 
             result = MaaAdapter(
@@ -555,6 +565,11 @@ class TestMaaAdapter(unittest.TestCase):
             self.assertEqual(
                 pm.wait_process_calls,
                 [("Arknights.exe", cfg["game_executable"])],
+            )
+            # 接管同样使用配置的精确路径（T-008 #1 / T-010 原生标识语义）。
+            self.assertEqual(
+                pm.native_claim_calls,
+                [(810, cfg["game_executable"], (1234 << 32) | 7)],
             )
 
     def test_wait_completion_disabled_autorun_returns_manual_required(self):
@@ -738,6 +753,426 @@ class TestMaaAdapter(unittest.TestCase):
             r = a.start_game()
             self.assertFalse(r.ok)
             self.assertEqual(r.code, CODE_START_FAILED)
+
+
+# --------------------------------------------------------------------------- #
+# MaaAdapter 游戏归属与极快完成（T-008 #1、#6-MAA）                            #
+# --------------------------------------------------------------------------- #
+
+
+class TestMaaGameOwnership(unittest.TestCase):
+    def _game_rec(self, pid=301, native=(1234 << 32) | 99,
+                  full_path="C:\\Arknights.exe") -> ProcessRecord:
+        return ProcessRecord(
+            pid=pid, executable="Arknights.exe", full_path=full_path,
+            owned=False, create_time=1.0, native_create_time=native,
+        )
+
+    def test_start_game_records_baseline_and_takeover_succeeds(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _arknights_cfg(tmp, run_directly=True)
+            pm = FakeProcessMonitor()
+            pm.set_find("Arknights.exe", [self._game_rec(pid=300)])
+            adapter = MaaAdapter(game_cfg=cfg, process_monitor=pm)
+
+            self.assertTrue(adapter.start_game().ok)
+            self.assertEqual(adapter._baseline_game_pids, {300})
+            # 启动器拉起后：新 PID 301 出现（300 仍在，属于基线）。
+            pm.set_wait_process("Arknights.exe", [
+                self._game_rec(pid=300), self._game_rec(pid=301),
+            ])
+            ready = adapter.wait_game_ready(1)
+
+            self.assertTrue(ready.ok)
+            self.assertEqual(pm.claimed, [301])
+            self.assertEqual(
+                pm.native_claim_calls,
+                [(301, cfg["game_executable"], (1234 << 32) | 99)],
+            )
+            self.assertEqual(adapter._owned_game_pids, {301})
+            # cleanup 关闭本轮接管的 Arknights，不触碰基线中的原有实例。
+            cleanup = adapter.cleanup()
+            self.assertTrue(cleanup.ok)
+            self.assertIn(301, pm.terminated)
+            self.assertNotIn(300, pm.terminated)
+
+    def test_takeover_failure_blocks_helper_and_partial_ownership_goes_to_cleanup(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _arknights_cfg(tmp, run_directly=True)
+            pm = FakeProcessMonitor()
+            adapter = MaaAdapter(game_cfg=cfg, process_monitor=pm)
+            pm.set_wait_process("Arknights.exe", [
+                self._game_rec(pid=301),
+                self._game_rec(pid=302, native=(1234 << 32) | 200),
+            ])
+            real_take = pm.take_ownership
+
+            def _reject_second(pid, **kwargs):
+                if pid == 302:
+                    return None
+                return real_take(pid, **kwargs)
+
+            pm.take_ownership = _reject_second
+
+            ready = adapter.wait_game_ready(1)
+
+            self.assertFalse(ready.ok)
+            self.assertEqual(ready.code, CODE_ENV_NOT_READY)
+            self.assertEqual(ready.details["pid"], 302)
+            # 已接管的部分交给 cleanup 并成功关闭；被拒绝的 PID 绝不终止。
+            self.assertEqual(adapter._owned_game_pids, {301})
+            self.assertNotIn(302, pm.terminated)
+            cleanup = adapter.cleanup()
+            self.assertIn(301, pm.terminated)
+            self.assertTrue(cleanup.ok)
+
+    def test_takeover_rejection_fails_closed_without_ownership(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _arknights_cfg(tmp, run_directly=True)
+            pm = FakeProcessMonitor()
+            pm.take_ownership_result = False
+            pm.set_wait_process("Arknights.exe", [self._game_rec(pid=301)])
+            adapter = MaaAdapter(game_cfg=cfg, process_monitor=pm)
+
+            ready = adapter.wait_game_ready(1)
+
+            self.assertFalse(ready.ok)
+            self.assertEqual(ready.code, CODE_ENV_NOT_READY)
+            self.assertEqual(adapter._owned_game_pids, set())
+            cleanup = adapter.cleanup()
+            self.assertTrue(cleanup.ok)
+            self.assertEqual(pm.terminated, [])
+
+    def test_missing_native_identity_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _arknights_cfg(tmp, run_directly=True)
+            pm = FakeProcessMonitor()
+            pm.set_wait_process("Arknights.exe", [self._game_rec(pid=301, native=0)])
+            adapter = MaaAdapter(game_cfg=cfg, process_monitor=pm)
+
+            ready = adapter.wait_game_ready(1)
+
+            self.assertFalse(ready.ok)
+            self.assertEqual(ready.code, CODE_ENV_NOT_READY)
+            self.assertEqual(pm.claimed, [])
+            self.assertEqual(adapter._owned_game_pids, set())
+
+    def test_baseline_only_is_not_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _arknights_cfg(tmp, run_directly=True)
+            pm = FakeProcessMonitor()
+            pm.set_find("Arknights.exe", [self._game_rec(pid=300)])
+            adapter = MaaAdapter(game_cfg=cfg, process_monitor=pm)
+            self.assertTrue(adapter.start_game().ok)
+            # 重启场景：快照里只有基线中的原有实例，没有本轮新 PID。
+            pm.set_wait_process("Arknights.exe", [self._game_rec(pid=300)])
+
+            ready = adapter.wait_game_ready(1)
+
+            self.assertFalse(ready.ok)
+            self.assertEqual(ready.code, CODE_ENV_NOT_READY)
+            self.assertEqual(pm.claimed, [])
+            cleanup = adapter.cleanup()
+            self.assertTrue(cleanup.ok)
+            self.assertEqual(pm.terminated, [])
+
+    def test_helper_launch_failure_cleanup_still_closes_owned_game(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _arknights_cfg(tmp, run_directly=True)
+            cfg["helper"].update({
+                "requires_administrator": True,
+                "scheduled_task_name": "DailyGames-MAA-Admin",
+            })
+            pm = FakeProcessMonitor()
+            pm.set_wait_process("Arknights.exe", [self._game_rec(pid=301)])
+            adapter = MaaAdapter(game_cfg=cfg, process_monitor=pm)
+            self.assertTrue(adapter.wait_game_ready(1).ok)
+            # 助手失败场景一：/Run 成功但始终没有 MAA 进程出现。
+            self.assertFalse(adapter.start_helper().ok)
+
+            cleanup = adapter.cleanup()
+
+            # 已接管的游戏仍要关闭；本轮已触发的任务 /End 恰好一次。
+            self.assertEqual(pm.terminated, [301])
+            self.assertEqual(pm.stopped_scheduled_tasks, ["DailyGames-MAA-Admin"])
+            self.assertTrue(cleanup.ok)
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _arknights_cfg(tmp, run_directly=True)
+            cfg["helper"].update({
+                "requires_administrator": True,
+                "scheduled_task_name": "DailyGames-MAA-Admin",
+            })
+            pm = FakeProcessMonitor()
+            pm.set_wait_process("Arknights.exe", [self._game_rec(pid=302)])
+            pm.set_wait_process("MAA.exe", [ProcessRecord(
+                pid=830, executable="MAA.exe", full_path="C:\\MAA.exe",
+                owned=False, create_time=1.0,
+            )])
+            adapter = MaaAdapter(game_cfg=cfg, process_monitor=pm)
+            self.assertTrue(adapter.wait_game_ready(1).ok)
+            self.assertTrue(adapter.start_helper().ok)
+            # 助手失败场景二：MAA 停止失败（如先行退出/无法按 owned 关闭）。
+            pm.stop_scheduled_task_result = False
+            pm.wait_exit_results[adapter._started_helper_pid] = False
+
+            cleanup = adapter.cleanup()
+
+            # 即便 MAA 停止失败，本轮已接管的游戏仍被关闭并暴露 not_owned。
+            self.assertEqual(pm.terminated, [302])
+            self.assertFalse(cleanup.ok)
+            self.assertEqual(cleanup.code, "not_owned")
+
+    def test_empty_process_result_is_environment_not_ready(self):
+        """R2：wait_for_process 返回空列表同属无本轮新 PID 的失败契约。
+
+        与「快照全属基线」一致返回 environment_not_ready（非 wait_timeout），
+        保留超时/无进程诊断，零接管；停止优先不被改变。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _arknights_cfg(tmp, run_directly=True)
+            pm = FakeProcessMonitor()
+            pm.set_find("Arknights.exe", [self._game_rec(pid=300)])
+            adapter = MaaAdapter(game_cfg=cfg, process_monitor=pm)
+            self.assertTrue(adapter.start_game().ok)
+            pm.set_wait_process("Arknights.exe", [])
+
+            ready = adapter.wait_game_ready(0)
+
+            self.assertFalse(ready.ok)
+            self.assertEqual(ready.code, CODE_ENV_NOT_READY)
+            self.assertEqual(ready.details["timeout_s"], 0)
+            self.assertEqual(pm.claimed, [])
+            self.assertEqual(adapter._owned_game_pids, set())
+            # 停止优先不被改变：预先置位的停止事件仍返回 stop_requested。
+            stop = threading.Event()
+            stop.set()
+            ready = adapter.wait_game_ready(0, stop_event=stop)
+            self.assertEqual(ready.code, CODE_STOP_REQUESTED)
+
+    def test_monitor_without_take_ownership_is_rejected(self):
+        """配置完好但监控器不支持接管时，check_environment 必须拒绝。"""
+
+        class _NoTakeoverMonitor:
+            def scheduled_task_matches(self, *args, **kwargs):
+                return True
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _arknights_cfg(tmp, run_directly=True)
+            adapter = MaaAdapter(game_cfg=cfg, process_monitor=_NoTakeoverMonitor())
+
+            result = adapter.check_environment()
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_ENV_NOT_READY)
+            self.assertIn(
+                "进程监控器不支持安全接管本轮启动的 Arknights",
+                result.message,
+            )
+
+    def test_normal_completion_resets_tracking_and_cleanup_is_clean(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _arknights_cfg(tmp, run_directly=True)
+            pm = FakeProcessMonitor()
+            adapter = MaaAdapter(game_cfg=cfg, process_monitor=pm)
+            adapter.start_game()
+            pm.set_find("Arknights.exe", [])
+            pm.set_wait_process("Arknights.exe", [self._game_rec(pid=301)])
+            self.assertTrue(adapter.wait_game_ready(1).ok)
+            self.assertTrue(adapter.start_helper().ok)
+            pm.set_find("Arknights.exe", [self._game_rec(pid=301)])
+            pm.set_find("MAA.exe", [ProcessRecord(
+                pid=adapter._started_helper_pid,
+                executable="MAA.exe",
+                full_path="C:\\MAA.exe",
+                owned=True,
+                create_time=1.0,
+            )])
+
+            result = adapter.wait_completion(timeout_s=1)
+
+            self.assertTrue(result.ok)
+            # 正常双退出后跟踪已清空：cleanup 无 terminate、无 /End。
+            cleanup = adapter.cleanup()
+            self.assertTrue(cleanup.ok)
+            self.assertEqual(pm.terminated, [])
+            self.assertEqual(pm.stopped_scheduled_tasks, [])
+
+
+class _DelayedStopEvent:
+    """前 ``calls_before_stop`` 次 is_set() 返回 False，之后恒 True。
+
+    模拟在 wait_completion 执行期间（首次快照之后、关键出口之前）到达的
+    停止请求：真实场景由其他线程在两次检查之间 set()，此处用时序替身
+    确定性复现（T-011 R1）。
+    """
+
+    def __init__(self, calls_before_stop: int):
+        self._remaining = calls_before_stop
+        self._event = threading.Event()
+
+    def is_set(self):
+        if self._remaining > 0:
+            self._remaining -= 1
+            return False
+        self._event.set()
+        return True
+
+    def set(self):
+        self._event.set()
+
+    def wait(self, timeout=None):
+        return self._event.wait(timeout)
+
+
+class TestMaaFastCompletion(unittest.TestCase):
+    """T-008 #6（MAA）：双方极快退出按完成处理。"""
+
+    def _ready_adapter(self, tmp: Path):
+        cfg = _arknights_cfg(tmp, run_directly=True)
+        pm = FakeProcessMonitor()
+        adapter = MaaAdapter(game_cfg=cfg, process_monitor=pm)
+        adapter.start_game()
+        pm.set_find("Arknights.exe", [])
+        pm.set_wait_process("Arknights.exe", [ProcessRecord(
+            pid=301, executable="Arknights.exe", full_path="C:\\Arknights.exe",
+            owned=False, create_time=1.0, native_create_time=(1234 << 32) | 99,
+        )])
+        self.assertTrue(adapter.wait_game_ready(1).ok)
+        self.assertTrue(adapter.start_helper().ok)
+        # 双方从快照中消失（极快退出）。
+        pm.set_find("Arknights.exe", [])
+        pm.set_find("MAA.exe", [])
+        return adapter, pm
+
+    def test_both_sides_exited_immediately_is_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter, pm = self._ready_adapter(tmp)
+            helper_pid = adapter._started_helper_pid
+
+            result = adapter.wait_completion(timeout_s=1)
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.details["game_pids"], [301])
+            self.assertIn(301, pm.wait_exit_calls)
+            self.assertIn(helper_pid, pm.wait_exit_calls)
+            # 成功重置后 cleanup 干净：无 terminate、无 /End。
+            cleanup = adapter.cleanup()
+            self.assertTrue(cleanup.ok)
+            self.assertEqual(pm.terminated, [])
+            self.assertEqual(pm.stopped_scheduled_tasks, [])
+
+    def test_unknown_game_pid_is_not_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter, pm = self._ready_adapter(tmp)
+            adapter._owned_game_pids.clear()
+
+            result = adapter.wait_completion(timeout_s=1)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_HELPER_EXITED_EARLY)
+            self.assertEqual(pm.terminated, [])
+
+    def test_unknown_helper_pid_is_not_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter, pm = self._ready_adapter(tmp)
+            adapter._started_helper_pid = None
+            adapter._owned_helper_pids.clear()
+
+            result = adapter.wait_completion(timeout_s=1)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_HELPER_EXITED_EARLY)
+
+    def test_unconfirmed_exit_is_not_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter, pm = self._ready_adapter(tmp)
+            pm.set_wait_exit(301, False)
+
+            result = adapter.wait_completion(timeout_s=1)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_HELPER_EXITED_EARLY)
+            self.assertEqual(result.details["unconfirmed_pid"], 301)
+
+    def test_one_side_missing_still_fails_fast(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter, pm = self._ready_adapter(tmp)
+            pm.set_find("Arknights.exe", [ProcessRecord(
+                pid=301, executable="Arknights.exe", full_path="C:\\Arknights.exe",
+                owned=False, create_time=1.0,
+            )])
+
+            result = adapter.wait_completion(timeout_s=1)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_HELPER_EXITED_EARLY)
+            self.assertEqual(result.details["missing"], "helper")
+
+    def test_stop_takes_priority_in_fast_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter, pm = self._ready_adapter(tmp)
+            pm.set_wait_exit(301, False)
+            stop = threading.Event()
+            stop.set()
+
+            result = adapter.wait_completion(timeout_s=1, stop_event=stop)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_STOP_REQUESTED)
+
+    def test_stop_after_snapshot_with_missing_game_pid_takes_priority(self):
+        """R1 时序①：首次快照之后、缺 PID 出口之前到达的停止请求优先。"""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter, pm = self._ready_adapter(tmp)
+            adapter._owned_game_pids.clear()
+            stop = _DelayedStopEvent(calls_before_stop=1)
+
+            result = adapter.wait_completion(timeout_s=1, stop_event=stop)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_STOP_REQUESTED)
+
+    def test_stop_after_exit_confirmation_returns_stop_without_success_reset(self):
+        """R1 时序②：全部确认退出后到达的停止请求优先，不走成功重置。"""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapter, pm = self._ready_adapter(tmp)
+            helper_pid = adapter._started_helper_pid
+            stop = _DelayedStopEvent(calls_before_stop=1)
+
+            result = adapter.wait_completion(timeout_s=1, stop_event=stop)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, CODE_STOP_REQUESTED)
+            # 停止路径不走成功重置：跟踪保留，cleanup 仍尝试关闭双方
+            # （替身中已确认退出的 PID 不再可 terminate → not_owned）。
+            self.assertEqual(adapter._owned_game_pids, {301})
+            self.assertEqual(adapter._started_helper_pid, helper_pid)
+            cleanup = adapter.cleanup()
+            self.assertFalse(cleanup.ok)
+            self.assertEqual(cleanup.code, "not_owned")
+            self.assertEqual(
+                sorted(cleanup.details["failed_pids"]),
+                sorted([301, helper_pid]),
+            )
 
 
 # --------------------------------------------------------------------------- #

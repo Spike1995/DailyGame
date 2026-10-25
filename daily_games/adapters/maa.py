@@ -52,6 +52,9 @@ class MaaAdapter(AdapterBase):
         self._started_helper_pid: int | None = None
         self._helper_launch_time = 0.0
         self._owned_helper_pids: set[int] = set()
+        # T-008 #1：本轮游戏基线与已接管的 Arknights。
+        self._baseline_game_pids: set[int] = set()
+        self._owned_game_pids: set[int] = set()
         self._scheduled_task_name = str(helper.get("scheduled_task_name", "")).strip()
         self._scheduled_task_started = False
         self._scheduled_game_task_name = str(
@@ -163,14 +166,33 @@ class MaaAdapter(AdapterBase):
                 "MAA 的 PostActions 必须同时包含 ExitArknights 与 ExitSelf",
                 details,
             )
+        # T-008 #1：本轮 Arknights 必须能被安全接管并纳入清理。放在信号检查
+        # 之后，使配置侧的 manual/completion 诊断码不被监控器问题遮蔽
+        # （与 maaend 一致）。
+        if not callable(getattr(self._pm, "take_ownership", None)):
+            return StepResult(
+                False,
+                CODE_ENV_NOT_READY,
+                "进程监控器不支持安全接管本轮启动的 Arknights",
+                details,
+            )
         return StepResult(True, CODE_OK, "MAA 环境与双进程退出信号检查通过", details)
 
     def start_game(self) -> StepResult:
         """通过鹰角启动器启动明日方舟。
 
-        启动器参数未验证时，仍尝试启动（让用户观察），但会在返回中标记未验证，
-        供编排器决定是否需要改用 UI Automation。
+        启动前记录本轮基线游戏 PID（T-008 #1），``wait_game_ready`` 据此只
+        接管本轮新出现的实例。启动器参数未验证时，仍尝试启动（让用户观察），
+        但会在返回中标记未验证，供编排器决定是否需要改用 UI Automation。
         """
+        game_name = str(self._game_cfg.get("game_process_name", "Arknights.exe"))
+        game_path = str(self._game_cfg.get("game_executable", ""))
+        self._baseline_game_pids = {
+            rec.pid
+            for rec in self._pm.find_by_executable(
+                game_name, expected_path=game_path
+            )
+        }
         lex = self._launcher.get("executable")
         args = self._launcher.get("args", [])
         if not lex or not Path(str(lex)).is_file():
@@ -224,7 +246,12 @@ class MaaAdapter(AdapterBase):
         )
 
     def wait_game_ready(self, timeout_s: float, stop_event: object | None = None) -> StepResult:
-        """等待 Arknights.exe 进程出现。"""
+        """等待本轮新启动的 Arknights 出现，并按精确路径与原生创建身份接管。
+
+        基线中的原有实例不接管；无新 PID、缺可信创建标识或任一接管失败都
+        返回 ``environment_not_ready``，不启动 MAA；已接管的部分交给
+        cleanup（T-008 #1）。
+        """
         name = str(self._game_cfg.get("game_process_name", "Arknights.exe"))
         game_path = str(self._game_cfg.get("game_executable", ""))
         recs = self._pm.wait_for_process(
@@ -236,8 +263,49 @@ class MaaAdapter(AdapterBase):
         if _stop_requested(stop_event):
             return StepResult(False, CODE_STOP_REQUESTED, "等待游戏进程时收到停止要求", {})
         if not recs:
-            return StepResult(False, CODE_WAIT_TIMEOUT, f"等待 {name} 超时", {"timeout_s": timeout_s})
-        return StepResult(True, CODE_OK, f"{name} 已出现", {"pids": [r.pid for r in recs]})
+            # R2：完全没有本轮新游戏与「快照全属基线」同属无本轮新 PID 的
+            # 失败契约，统一返回 environment_not_ready，保留超时/无进程诊断；
+            # 停止优先已在上一个分支处理，此处零接管。
+            return StepResult(
+                False,
+                CODE_ENV_NOT_READY,
+                f"等待窗口内未出现本轮新启动的 {name}（超时或未启动），无法安全接管并在清理时关闭",
+                {"timeout_s": timeout_s, "pids": []},
+            )
+
+        new_records = [
+            rec for rec in recs if rec.pid not in self._baseline_game_pids
+        ]
+        if not new_records:
+            return StepResult(
+                False,
+                CODE_ENV_NOT_READY,
+                f"未发现本轮新启动的 {name}，无法安全接管并在清理时关闭",
+                {"pids": [rec.pid for rec in recs]},
+            )
+        for rec in new_records:
+            if rec.native_create_time <= 0:
+                # 缺原生创建标识无法证明是本轮实例：失败关闭（T-010 语义）。
+                return StepResult(
+                    False,
+                    CODE_ENV_NOT_READY,
+                    f"无法取得 {name}（PID {rec.pid}）的可信创建标识，已停止后续自动化",
+                    {"pid": rec.pid},
+                )
+            claimed = self._pm.take_ownership(
+                rec.pid,
+                expected_path=game_path,
+                expected_native_create_time=rec.native_create_time,
+            )
+            if claimed is None:
+                return StepResult(
+                    False,
+                    CODE_ENV_NOT_READY,
+                    f"无法接管本轮启动的 {name}，已停止后续自动化",
+                    {"pid": rec.pid},
+                )
+            self._owned_game_pids.add(rec.pid)
+        return StepResult(True, CODE_OK, f"{name} 已出现并完成接管", {"pids": [r.pid for r in recs]})
 
     def start_helper(self) -> StepResult:
         """启动新的 MAA.exe；自动执行完全由已验证的原生配置触发。"""
@@ -351,6 +419,54 @@ class MaaAdapter(AdapterBase):
         initial_helper_recs = list(
             self._pm.find_by_executable(helper_name, expected_path=helper_path)
         )
+        if not initial_game_recs and not initial_helper_recs:
+            # T-008 #6（MAA）：双方极快退出。只有两侧都有本轮已知 PID，且
+            # 全部确认退出，才按完成处理；停止优先。任一侧缺少本轮已知
+            # PID、仍存活或无法确认退出，都维持 helper_exited_early。
+            known_game_pids = set(self._owned_game_pids)
+            known_helper_pids = set(self._owned_helper_pids)
+            if self._started_helper_pid is not None:
+                known_helper_pids.add(self._started_helper_pid)
+            if not known_game_pids or not known_helper_pids:
+                # R1 时序①：停止请求可能在首次快照之后到达；缺 PID 出口
+                # 同样必须停止优先。
+                if _stop_requested(stop_event):
+                    return StepResult(False, CODE_STOP_REQUESTED, "等待完成时收到停止要求", {})
+                return StepResult(
+                    False,
+                    CODE_HELPER_EXITED_EARLY,
+                    "双方进程均已不在快照中，且缺少本轮已知 PID，不能推断完成",
+                    {
+                        "known_game_pids": sorted(known_game_pids),
+                        "known_helper_pids": sorted(known_helper_pids),
+                    },
+                )
+            for pid in sorted(known_game_pids | known_helper_pids):
+                if not self._pm.wait_for_exit(pid, 0, stop_event):
+                    if _stop_requested(stop_event):
+                        return StepResult(False, CODE_STOP_REQUESTED, "等待完成时收到停止要求", {})
+                    return StepResult(
+                        False,
+                        CODE_HELPER_EXITED_EARLY,
+                        "双方进程均已不在快照中，但本轮已知 PID 未确认退出",
+                        {"unconfirmed_pid": pid},
+                    )
+            # R1 时序②：全部确认退出后到达的停止请求仍然优先，且停止路径
+            # 不得走成功重置（跟踪保留给 cleanup 关闭）。
+            if _stop_requested(stop_event):
+                return StepResult(False, CODE_STOP_REQUESTED, "等待完成时收到停止要求", {})
+            self._reset_helper_tracking()
+            self._owned_game_pids.clear()
+            self._baseline_game_pids.clear()
+            return StepResult(
+                True,
+                CODE_OK,
+                "明日方舟与 MAA 均已退出",
+                {
+                    "game_pids": sorted(known_game_pids),
+                    "helper_pids": sorted(known_helper_pids),
+                },
+            )
         if not initial_game_recs or not initial_helper_recs:
             missing = "game" if not initial_game_recs else "helper"
             return StepResult(
@@ -421,7 +537,11 @@ class MaaAdapter(AdapterBase):
             current_pids.update(rec.pid for rec in new_game_recs)
             current_pids.update(rec.pid for rec in new_helper_recs)
             if not current_pids:
+                # T-008 #1：正常退出后清空游戏/助手跟踪，避免 cleanup 对已
+                # 回收的 PID 再 terminate 制造假 not_owned。
                 self._reset_helper_tracking()
+                self._owned_game_pids.clear()
+                self._baseline_game_pids.clear()
                 return StepResult(
                     True,
                     CODE_OK,
@@ -452,7 +572,12 @@ class MaaAdapter(AdapterBase):
             time.sleep(min(self._completion_poll_interval(), remaining))
 
     def cleanup(self) -> StepResult:
-        """只结束本程序启动的 MAA（如有）。现有 MAA 从不接管。"""
+        """结束本程序启动的 MAA，并关闭本轮明确接管的 Arknights。
+
+        现有 MAA 与基线中的原有游戏实例从不接管。提权游戏可能关不掉：
+        终止失败仍以 ``not_owned`` 与退出屏障暴露，不宣称一定能结束
+        （T-008 #1）。
+        """
         pids = set(self._owned_helper_pids)
         if self._started_helper_pid is not None:
             pids.add(self._started_helper_pid)
@@ -476,19 +601,27 @@ class MaaAdapter(AdapterBase):
                 ok = self._pm.terminate_if_owned(pid)
                 (ended if ok else failed).append(pid)
         self._reset_helper_tracking()
+        # 关闭本轮明确接管的 Arknights；未接管的原有实例不在此列。
+        for pid in sorted(self._owned_game_pids):
+            if self._pm.terminate_if_owned(pid):
+                ended.append(pid)
+            else:
+                failed.append(pid)
+        self._owned_game_pids.clear()
+        self._baseline_game_pids.clear()
         if failed:
             result = StepResult(
                 False,
                 "not_owned",
-                "部分本轮 MAA 已先行退出或无法按 owned 规则关闭；将由退出屏障复查",
+                "部分本轮 MAA/游戏已先行退出或无法按 owned 规则关闭；将由退出屏障复查",
                 {"ended_pids": ended, "failed_pids": failed},
             )
         elif ended:
             result = StepResult(
-                True, CODE_OK, "已结束本程序启动的 MAA", {"ended_pids": ended}
+                True, CODE_OK, "已结束本程序启动的 MAA 与本轮游戏", {"ended_pids": ended}
             )
         else:
-            result = StepResult(True, CODE_OK, "无需清理（本轮未启动 MAA）", {})
+            result = StepResult(True, CODE_OK, "无需清理（本轮未启动 MAA 或游戏）", {})
 
         if self._scheduled_game_task_started and self._scheduled_game_task_name:
             self._stop_scheduled_task_with_warning(
