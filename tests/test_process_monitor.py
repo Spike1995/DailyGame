@@ -1512,5 +1512,138 @@ class TestProcessRecord(unittest.TestCase):
         )
 
 
+class _FakeVersionApi:
+    """version.dll 替身：按剧本回写 Translation 与 FileVersion。
+
+    byref 传递的 ctypes 变量经 ``_obj`` 回写；缓冲区挂在实例上，保证
+    指针在读取期间存活。全程不触碰真实 Win32，也不启动任何进程。
+    """
+
+    def __init__(
+        self,
+        *,
+        file_version: str = "1.6.0.1604",
+        size: int = 64,
+        info_ok: bool = True,
+        translation_ok: bool = True,
+        query_ok: bool = True,
+        raise_error: Exception | None = None,
+    ):
+        self.file_version = file_version
+        self.size = size
+        self.info_ok = info_ok
+        self.translation_ok = translation_ok
+        self.query_ok = query_ok
+        self.raise_error = raise_error
+        self.calls: list[tuple[str, object]] = []
+        self._translation = (ctypes.c_uint16 * 2)(0x0409, 0x04B0)
+        self._text = ctypes.create_unicode_buffer(file_version)
+
+    def GetFileVersionInfoSizeW(self, path, reserved):
+        self.calls.append(("size", str(path)))
+        if self.raise_error is not None:
+            raise self.raise_error
+        return self.size
+
+    def GetFileVersionInfoW(self, path, handle, size, block):
+        self.calls.append(("info", str(path), size))
+        return int(self.info_ok)
+
+    def VerQueryValueW(self, block, subblock, value_ref, length_ref):
+        self.calls.append(("query", str(subblock)))
+        if self.raise_error is not None:
+            raise self.raise_error
+        if subblock == "\\VarFileInfo\\Translation":
+            if not self.translation_ok:
+                return 0
+            value_ref._obj.value = ctypes.cast(
+                self._translation, ctypes.c_void_p
+            ).value
+            length_ref._obj.value = ctypes.sizeof(self._translation)
+            return 1
+        if not self.query_ok:
+            return 0
+        value_ref._obj.value = ctypes.cast(self._text, ctypes.c_void_p).value
+        length_ref._obj.value = len(self.file_version) + 1
+        return 1
+
+
+class TestReadFileVersion(unittest.TestCase):
+    def test_reads_file_version_without_spawning_processes(self):
+        with tempfile.TemporaryDirectory() as td:
+            exe = Path(td) / "Games.exe"
+            exe.write_bytes(b"MZ dummy")
+            api = _FakeVersionApi(file_version="1.6.0.1604")
+            with (
+                mock.patch.object(
+                    process_monitor_module.subprocess, "run",
+                    side_effect=AssertionError("不得调用 subprocess"),
+                ),
+                mock.patch.object(
+                    process_monitor_module.subprocess, "Popen",
+                    side_effect=AssertionError("不得调用 subprocess"),
+                ),
+                mock.patch.object(
+                    process_monitor_module.os, "startfile",
+                    side_effect=AssertionError("不得调用 os.startfile"),
+                ),
+                mock.patch.object(
+                    process_monitor_module, "_version_api", return_value=api,
+                ),
+            ):
+                version = process_monitor_module.read_file_version(exe)
+
+            self.assertEqual(version, "1.6.0.1604")
+            self.assertEqual(api.calls[0], ("size", str(exe)))
+            self.assertEqual(
+                [call[0] for call in api.calls],
+                ["size", "info", "query", "query"],
+            )
+
+    def test_returns_unknown_when_any_step_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            exe = Path(td) / "Games.exe"
+            exe.write_bytes(b"MZ dummy")
+            scenarios = {
+                "size_zero": _FakeVersionApi(size=0),
+                "info_failed": _FakeVersionApi(info_ok=False),
+                "translation_missing": _FakeVersionApi(translation_ok=False),
+                "query_failed": _FakeVersionApi(query_ok=False),
+                "empty_version": _FakeVersionApi(file_version=""),
+                "api_exception": _FakeVersionApi(raise_error=OSError("读取失败")),
+            }
+            for label, api in scenarios.items():
+                with self.subTest(scenario=label):
+                    with mock.patch.object(
+                        process_monitor_module, "_version_api", return_value=api,
+                    ):
+                        self.assertEqual(
+                            process_monitor_module.read_file_version(exe),
+                            process_monitor_module.UNKNOWN_VERSION,
+                        )
+            with mock.patch.object(
+                process_monitor_module, "_version_api", return_value=None,
+            ):
+                self.assertEqual(
+                    process_monitor_module.read_file_version(exe),
+                    process_monitor_module.UNKNOWN_VERSION,
+                )
+
+    def test_non_windows_returns_unknown_without_touching_version_api(self):
+        api = _FakeVersionApi()
+        with (
+            mock.patch.object(process_monitor_module, "IS_WINDOWS", False),
+            mock.patch.object(
+                process_monitor_module, "_version_api", return_value=api,
+            ) as api_factory,
+        ):
+            self.assertEqual(
+                process_monitor_module.read_file_version(r"C:\any\Games.exe"),
+                process_monitor_module.UNKNOWN_VERSION,
+            )
+        api_factory.assert_not_called()
+        self.assertEqual(api.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

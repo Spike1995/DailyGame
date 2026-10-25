@@ -22,6 +22,9 @@ from daily_games.config_manager import (
     CODE_HASH_MISMATCH,
     CODE_KEY_DUPLICATE,
     CODE_KEY_MISSING,
+    CODE_LAUNCHER_IDENTITY_PATH_MISSING,
+    CODE_LAUNCHER_IDENTITY_UNVERIFIABLE,
+    CODE_LAUNCHER_IDENTITY_VERSION_MISMATCH,
     CODE_OK,
     CODE_PARSE_FAILED,
     CODE_SOFTWARE_PATH_AMBIGUOUS,
@@ -458,6 +461,227 @@ class TestPreflightLimbusActivityPolicy(unittest.TestCase):
             self.assertFalse(_activity_policy_results(results)[0].ok)
             self.assertEqual(p.read_bytes(), before)
             self.assertFalse((tmp / "b").exists())
+
+
+def _set_window_process_identity(
+    user_path: Path, gid: str, path: Path, version: str,
+) -> None:
+    """为指定游戏钉住已批准的启动器窗口进程身份（临时文件，非真实目录）。"""
+    data = json.loads(user_path.read_text(encoding="utf-8"))
+    automation = data["games"][gid]["launcher"].setdefault(
+        "start_button_automation", {}
+    )
+    automation["enabled"] = True
+    automation["verified"] = True
+    automation["window_process_name"] = "Games"
+    automation["window_process_path"] = str(path)
+    automation["window_process_version"] = version
+    user_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+class TestLauncherIdentityPreflight(unittest.TestCase):
+    """T-006 S2：启动器窗口进程身份漂移预检（版本读取全部 mock）。"""
+
+    APPROVED = "1.6.0.1604"
+
+    def setUp(self):
+        ctx = tempfile.TemporaryDirectory()
+        self.addCleanup(ctx.cleanup)
+        self.tmp = Path(ctx.name)
+        self.user_path = _make_user_config(self.tmp)
+        self.arknights_exe = self.tmp / "1.6.0" / "Games.exe"
+        self.arknights_exe.parent.mkdir(parents=True)
+        self.arknights_exe.write_bytes(b"MZ dummy")
+        self.endfield_exe = self.tmp / "1.6.0-end" / "Games.exe"
+        self.endfield_exe.parent.mkdir(parents=True)
+        self.endfield_exe.write_bytes(b"MZ dummy")
+
+    def identity_results(self, results):
+        return [
+            r for r in results
+            if r.name.endswith("launcher.window_process_identity")
+        ]
+
+    def test_matching_identity_passes_with_worker_note(self):
+        _set_window_process_identity(
+            self.user_path, "arknights", self.arknights_exe, self.APPROVED,
+        )
+        _set_window_process_identity(
+            self.user_path, "endfield", self.endfield_exe, self.APPROVED,
+        )
+
+        with mock.patch(
+            "daily_games.config_manager.read_file_version",
+            return_value=self.APPROVED,
+        ) as read_version:
+            results = ConfigManager(
+                self.user_path, self.tmp / "b",
+            ).preflight()
+
+        identity = self.identity_results(results)
+        self.assertEqual(len(identity), 2)
+        self.assertTrue(all(result.ok for result in identity))
+        self.assertEqual([r.code for r in identity], [CODE_OK, CODE_OK])
+        self.assertIn("签名未在预检核验", identity[0].message)
+        self.assertIn("worker", identity[0].message)
+        self.assertIn(
+            f"与批准值一致：{self.arknights_exe} {self.APPROVED}",
+            identity[0].message,
+        )
+        # 只读版本读取发生在各游戏批准的绝对路径上。
+        self.assertEqual(read_version.call_count, 2)
+        observed_paths = {
+            Path(str(call.args[0])) for call in read_version.call_args_list
+        }
+        self.assertEqual(observed_paths, {self.arknights_exe, self.endfield_exe})
+
+    def test_version_mismatch_blocks_with_approved_and_observed(self):
+        _set_window_process_identity(
+            self.user_path, "arknights", self.arknights_exe, self.APPROVED,
+        )
+
+        with mock.patch(
+            "daily_games.config_manager.read_file_version",
+            return_value="1.7.0.1",
+        ):
+            results = ConfigManager(
+                self.user_path, self.tmp / "b",
+            ).preflight()
+
+        identity = next(
+            r for r in results
+            if r.name == "games.arknights.launcher.window_process_identity"
+        )
+        self.assertFalse(identity.ok)
+        self.assertEqual(identity.code, CODE_LAUNCHER_IDENTITY_VERSION_MISMATCH)
+        self.assertEqual(identity.severity, "error")
+        self.assertIn(f"批准：{self.arknights_exe} {self.APPROVED}", identity.message)
+        self.assertIn(f"观察：{self.arknights_exe} 1.7.0.1", identity.message)
+        for keyword in ("有效签名", "窗口标题", "目标选择", "批准配置", "worker"):
+            self.assertIn(keyword, identity.message)
+
+    def test_missing_path_blocks_without_reading_version(self):
+        missing = self.tmp / "1.9.0" / "Games.exe"
+        _set_window_process_identity(
+            self.user_path, "arknights", missing, self.APPROVED,
+        )
+
+        with mock.patch(
+            "daily_games.config_manager.read_file_version",
+        ) as read_version:
+            results = ConfigManager(
+                self.user_path, self.tmp / "b",
+            ).preflight()
+
+        identity = next(
+            r for r in results
+            if r.name == "games.arknights.launcher.window_process_identity"
+        )
+        self.assertFalse(identity.ok)
+        self.assertEqual(identity.code, CODE_LAUNCHER_IDENTITY_PATH_MISSING)
+        self.assertIn("路径不存在", identity.message)
+        self.assertIn(f"批准：{missing} {self.APPROVED}", identity.message)
+        read_version.assert_not_called()
+
+    def test_unreadable_version_fails_closed_as_unverifiable(self):
+        _set_window_process_identity(
+            self.user_path, "endfield", self.endfield_exe, self.APPROVED,
+        )
+
+        with mock.patch(
+            "daily_games.config_manager.read_file_version",
+            return_value="unknown",
+        ):
+            results = ConfigManager(
+                self.user_path, self.tmp / "b",
+            ).preflight()
+
+        identity = next(
+            r for r in results
+            if r.name == "games.endfield.launcher.window_process_identity"
+        )
+        self.assertFalse(identity.ok)
+        self.assertEqual(identity.code, CODE_LAUNCHER_IDENTITY_UNVERIFIABLE)
+        self.assertEqual(identity.severity, "error")
+        self.assertIn("无法核验", identity.message)
+        self.assertIn("版本无法读取", identity.message)
+        self.assertIn(f"批准：{self.endfield_exe} {self.APPROVED}", identity.message)
+        # 失败关闭：不得说成正常或已更新。
+        self.assertNotIn("已更新", identity.message)
+        self.assertNotIn("一致", identity.message)
+
+    def test_each_game_drift_is_reported_separately(self):
+        _set_window_process_identity(
+            self.user_path, "arknights", self.arknights_exe, self.APPROVED,
+        )
+        _set_window_process_identity(
+            self.user_path, "endfield", self.endfield_exe, self.APPROVED,
+        )
+
+        def fake_read(path):
+            return (
+                "1.7.0.1"
+                if Path(str(path)) == self.arknights_exe
+                else self.APPROVED
+            )
+
+        with mock.patch(
+            "daily_games.config_manager.read_file_version",
+            side_effect=fake_read,
+        ):
+            results = ConfigManager(
+                self.user_path, self.tmp / "b",
+            ).preflight()
+
+        by_name = {
+            r.name: r for r in self.identity_results(results)
+        }
+        self.assertEqual(
+            set(by_name),
+            {
+                "games.arknights.launcher.window_process_identity",
+                "games.endfield.launcher.window_process_identity",
+            },
+        )
+        self.assertFalse(by_name["games.arknights.launcher.window_process_identity"].ok)
+        self.assertEqual(
+            by_name["games.arknights.launcher.window_process_identity"].code,
+            CODE_LAUNCHER_IDENTITY_VERSION_MISMATCH,
+        )
+        self.assertTrue(by_name["games.endfield.launcher.window_process_identity"].ok)
+        self.assertEqual(
+            by_name["games.endfield.launcher.window_process_identity"].code,
+            CODE_OK,
+        )
+
+    def test_preflight_reports_drift_without_writing_config(self):
+        _set_window_process_identity(
+            self.user_path, "arknights", self.arknights_exe, self.APPROVED,
+        )
+        before = self.user_path.read_bytes()
+
+        with mock.patch(
+            "daily_games.config_manager.read_file_version",
+            return_value="1.7.0.1",
+        ):
+            results = ConfigManager(
+                self.user_path, self.tmp / "b",
+            ).preflight()
+
+        self.assertFalse(self.identity_results(results)[0].ok)
+        self.assertEqual(self.user_path.read_bytes(), before)
+        self.assertFalse((self.tmp / "b").exists())
+
+    def test_unpinned_window_process_produces_no_identity_result(self):
+        with mock.patch(
+            "daily_games.config_manager.read_file_version",
+        ) as read_version:
+            results = ConfigManager(
+                self.user_path, self.tmp / "b",
+            ).preflight()
+
+        self.assertEqual(self.identity_results(results), [])
+        read_version.assert_not_called()
 
 
 class TestSoftwarePathSelfCheck(unittest.TestCase):

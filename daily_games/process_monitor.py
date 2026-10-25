@@ -221,6 +221,105 @@ def _windows_api_error(operation: str) -> OSError:
     )
 
 
+@lru_cache(maxsize=1)
+def _version_api():
+    """载入并声明文件版本 API（version.dll），供只读版本诊断使用。"""
+    if not IS_WINDOWS:
+        return None
+    try:
+        version_dll = ctypes.WinDLL("version", use_last_error=True)
+        version_dll.GetFileVersionInfoSizeW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        version_dll.GetFileVersionInfoSizeW.restype = ctypes.c_uint32
+        version_dll.GetFileVersionInfoW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        version_dll.GetFileVersionInfoW.restype = ctypes.c_int
+        version_dll.VerQueryValueW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        version_dll.VerQueryValueW.restype = ctypes.c_int
+        return version_dll
+    except (AttributeError, OSError, TypeError):
+        return None
+
+
+UNKNOWN_VERSION = "unknown"
+
+
+def read_file_version(exe_path: str | os.PathLike[str]) -> str:
+    """只读返回 exe 的 FileVersion 字符串；无法读取时返回 ``unknown``。
+
+    仅供启动器身份漂移等只读诊断（T-006 S2）使用：只调用
+    GetFileVersionInfoW/VerQueryValueW 读取版本资源，不启动进程、
+    不调用 PowerShell、不验证签名；授权仍以启动 worker 的
+    签名/ACL/哈希门控为准。任何一步失败都返回 ``unknown``，调用方
+    必须失败关闭，不得把读不到当成版本一致。
+    """
+    if not IS_WINDOWS:
+        return UNKNOWN_VERSION
+    version_dll = _version_api()
+    if version_dll is None:
+        return UNKNOWN_VERSION
+    path = os.fspath(exe_path)
+    try:
+        size = int(version_dll.GetFileVersionInfoSizeW(path, None))
+        if size <= 0:
+            return UNKNOWN_VERSION
+        block = ctypes.create_string_buffer(size)
+        block_pointer = ctypes.cast(block, ctypes.c_void_p)
+        if not version_dll.GetFileVersionInfoW(path, 0, size, block_pointer):
+            return UNKNOWN_VERSION
+
+        value_pointer = ctypes.c_void_p()
+        value_length = ctypes.c_uint32()
+        if (
+            not version_dll.VerQueryValueW(
+                block_pointer,
+                "\\VarFileInfo\\Translation",
+                ctypes.byref(value_pointer),
+                ctypes.byref(value_length),
+            )
+            or value_length.value < 4
+            or not value_pointer.value
+        ):
+            return UNKNOWN_VERSION
+        translation = ctypes.cast(value_pointer, ctypes.POINTER(ctypes.c_uint16))
+        subblock = (
+            f"\\StringFileInfo\\{translation[0]:04X}{translation[1]:04X}"
+            "\\FileVersion"
+        )
+
+        value_pointer = ctypes.c_void_p()
+        value_length = ctypes.c_uint32()
+        if (
+            not version_dll.VerQueryValueW(
+                block_pointer,
+                subblock,
+                ctypes.byref(value_pointer),
+                ctypes.byref(value_length),
+            )
+            or value_length.value == 0
+            or not value_pointer.value
+        ):
+            return UNKNOWN_VERSION
+        # VerQueryValueW 返回的长度含结尾 NUL；空串同样视为不可核验。
+        text = ctypes.wstring_at(
+            value_pointer.value, max(0, value_length.value - 1),
+        ).strip()
+        return text or UNKNOWN_VERSION
+    except (OSError, ValueError, IndexError, ctypes.ArgumentError):
+        return UNKNOWN_VERSION
+
+
 # --------------------------------------------------------------------------- #
 # 进程记录类型                                                             #
 # --------------------------------------------------------------------------- #
@@ -1499,4 +1598,6 @@ __all__ = [
     "ProcessMonitor",
     "ProcessRecord",
     "IS_WINDOWS",
+    "UNKNOWN_VERSION",
+    "read_file_version",
 ]

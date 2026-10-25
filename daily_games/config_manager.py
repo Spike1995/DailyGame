@@ -33,6 +33,7 @@ from daily_games.completion_policy import (
     CompletionPolicyError,
     resolve_limbus_activity_policy,
 )
+from daily_games.process_monitor import UNKNOWN_VERSION, read_file_version
 
 # --------------------------------------------------------------------------- #
 # 稳定错误码与严重等级                                                       #
@@ -66,6 +67,16 @@ CODE_SOFTWARE_PATH_REPAIRED = "software_path_repaired"
 CODE_SOFTWARE_PATH_NOT_FOUND = "software_path_not_found"
 CODE_SOFTWARE_PATH_AMBIGUOUS = "software_path_ambiguous"
 CODE_SOFTWARE_PATH_WRITE_FAILED = "software_path_write_failed"
+CODE_LAUNCHER_IDENTITY_PATH_MISSING = "launcher_identity_path_missing"
+CODE_LAUNCHER_IDENTITY_VERSION_MISMATCH = "launcher_identity_version_mismatch"
+CODE_LAUNCHER_IDENTITY_UNVERIFIABLE = "launcher_identity_unverifiable"
+
+# T-006 S2：启动器身份漂移的恢复步骤要点（核验新版本 → 维护流程更新批准配置
+# 并重装受保护 worker/计划任务）。预检绝不自动改路径/版本/签名/verified。
+LAUNCHER_IDENTITY_RECOVERY_STEPS = (
+    "请核验新版本路径、有效签名/既有可信发布者、窗口标题/尺寸、"
+    "目标选择及位置，再由维护流程更新批准配置并重装受保护 worker/计划任务。"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -1026,6 +1037,9 @@ class ConfigManager:
                     severity=SEVERITY_INFO if verified else SEVERITY_WARNING,
                     details={"verified": verified, "args": launcher.get("args", [])},
                 ))
+                results.extend(
+                    self._check_launcher_window_process_identity(gid, launcher)
+                )
             else:  # limbus
                 launch = g.get("launch", {})
                 fallback = launch.get("fallback_executable")
@@ -1172,6 +1186,112 @@ class ConfigManager:
                         ))
 
         return results
+
+    def _check_launcher_window_process_identity(
+        self, gid: str, launcher: Mapping[str, object],
+    ) -> list[CheckResult]:
+        """只读核对已批准的启动器窗口进程身份（T-006 S2 身份漂移诊断）。
+
+        配置未钉住 ``window_process_path`` + ``window_process_version`` 时
+        不产生结果。绝不修改 user.json、不搜索新 Games.exe、不抄当前签名、
+        不改 verified；签名/ACL/哈希仍由启动 worker 把关，预检只报告
+        批准值与磁盘观察值的差异。版本读不到按失败关闭（无法核验），
+        不得说成正常或已更新。
+        """
+        automation = launcher.get("start_button_automation", {})
+        if not isinstance(automation, Mapping):
+            return []
+        approved_path = automation.get("window_process_path")
+        approved_version = automation.get("window_process_version")
+        if not isinstance(approved_path, str) or not approved_path.strip():
+            return []
+        if not isinstance(approved_version, str) or not approved_version.strip():
+            return []
+        approved_path = approved_path.strip()
+        approved_version = approved_version.strip()
+
+        name = f"games.{gid}.launcher.window_process_identity"
+        base_details = {
+            "approved_path": approved_path,
+            "approved_version": approved_version,
+            "observed_path": approved_path,
+        }
+        path = Path(approved_path)
+        if not path.exists():
+            return [CheckResult(
+                name=name,
+                ok=False,
+                code=CODE_LAUNCHER_IDENTITY_PATH_MISSING,
+                message=(
+                    "启动器窗口进程身份无法确认"
+                    f"（批准：{approved_path} {approved_version}；"
+                    f"观察：{approved_path} 路径不存在），"
+                    "启动 worker 会拒绝点击。"
+                    + LAUNCHER_IDENTITY_RECOVERY_STEPS
+                ),
+                severity=SEVERITY_ERROR,
+                details={
+                    **base_details,
+                    "observed_version": "路径不存在",
+                    "path_exists": False,
+                },
+            )]
+
+        observed_version = read_file_version(path)
+        if observed_version == UNKNOWN_VERSION:
+            return [CheckResult(
+                name=name,
+                ok=False,
+                code=CODE_LAUNCHER_IDENTITY_UNVERIFIABLE,
+                message=(
+                    "启动器窗口进程身份无法核验"
+                    f"（批准：{approved_path} {approved_version}；"
+                    f"观察：{approved_path} 版本无法读取），"
+                    "启动 worker 会拒绝点击。"
+                    + LAUNCHER_IDENTITY_RECOVERY_STEPS
+                ),
+                severity=SEVERITY_ERROR,
+                details={
+                    **base_details,
+                    "observed_version": observed_version,
+                    "path_exists": True,
+                },
+            )]
+        if observed_version != approved_version:
+            return [CheckResult(
+                name=name,
+                ok=False,
+                code=CODE_LAUNCHER_IDENTITY_VERSION_MISMATCH,
+                message=(
+                    "启动器窗口进程身份与批准值不一致"
+                    f"（批准：{approved_path} {approved_version}；"
+                    f"观察：{approved_path} {observed_version}），"
+                    "启动 worker 会拒绝点击。"
+                    + LAUNCHER_IDENTITY_RECOVERY_STEPS
+                ),
+                severity=SEVERITY_ERROR,
+                details={
+                    **base_details,
+                    "observed_version": observed_version,
+                    "path_exists": True,
+                },
+            )]
+        return [CheckResult(
+            name=name,
+            ok=True,
+            code=CODE_OK,
+            message=(
+                f"启动器窗口进程身份与批准值一致："
+                f"{approved_path} {approved_version}；"
+                "签名未在预检核验，由启动 worker 把关。"
+            ),
+            severity=SEVERITY_INFO,
+            details={
+                **base_details,
+                "observed_version": observed_version,
+                "path_exists": True,
+            },
+        )]
 
     # ------------------------------------------------------------------ #
     # 变更规划                                                            #
