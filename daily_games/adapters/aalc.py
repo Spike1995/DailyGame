@@ -267,6 +267,12 @@ class AalcAdapter(AdapterBase):
 
         if bool(self._helper.get("requires_administrator", False)):
             helper_name = str(self._helper.get("process_name", "AALC.exe"))
+
+            def _mark_helper_task_started() -> None:
+                # /Run 成功即登记归属（T-008 #4）：等待超时/抛异常时 cleanup
+                # 仍能精确 /End 本轮已触发的任务。
+                self._scheduled_helper_task_started = True
+
             outcome = self._launch_helper_via_scheduled_task(
                 task_name=self._scheduled_helper_task_name,
                 helper_name=helper_name,
@@ -277,11 +283,11 @@ class AalcAdapter(AdapterBase):
                 not_ready_message="AALC 管理员计划任务不可用",
                 start_failed_message="无法启动 AALC 管理员计划任务",
                 no_process_message="管理员计划任务已触发，但未发现 AALC 进程",
+                on_task_started=_mark_helper_task_started,
             )
             if isinstance(outcome, StepResult):
                 return outcome
             _status, records = outcome
-            self._scheduled_helper_task_started = True
             self._started_helper_pid = records[0].pid
             return StepResult(
                 True,

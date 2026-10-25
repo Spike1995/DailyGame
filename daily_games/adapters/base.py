@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Mapping, Protocol, runtime_checkable
+from typing import Callable, Mapping, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -156,13 +156,19 @@ class AdapterBase:
         not_ready_message: str,
         start_failed_message: str,
         no_process_message: str,
+        on_task_started: Callable[[], None] | None = None,
     ) -> tuple[str, list] | StepResult:
         """通过预注册的最高权限计划任务启动助手进程，返回公共结论。
 
         三个助手适配器（MAA/MaaEnd/AALC）的 ``start_helper`` 管理员任务分支高度
         相似：检查任务名与可调用性、触发任务、等待进程出现。本方法封装这些共性，
-        不碰子类自有状态字段。调用方负责在成功后设置 ``_started_helper_pid``、
-        ``_scheduled_*_task_started`` 等字段，并构造带自身语义的成功 StepResult。
+        不碰子类自有状态字段。
+
+        ``on_task_started`` 在 ``start_scheduled_task`` 返回 True 之后、
+        ``wait_for_process`` 之前同步调用一次，用于登记本轮计划任务归属
+        （T-008 #4）：这样等待进程超时或抛异常时，cleanup 仍能精确 ``/End``
+        本轮已触发的任务。任务名缺失、接口不可用或 ``/Run`` 返回 False 时
+        不调用。``_started_helper_pid`` 等进程字段仍由调用方在拿到记录后设置。
 
         成功返回 ``("ok", records)``；失败返回对应的 ``StepResult``。
         """
@@ -174,6 +180,8 @@ class AdapterBase:
                 False, CODE_START_FAILED, start_failed_message,
                 {"scheduled_task": task_name},
             )
+        if on_task_started is not None:
+            on_task_started()
         records = list(
             self._pm.wait_for_process(
                 helper_name, start_timeout_s, None,

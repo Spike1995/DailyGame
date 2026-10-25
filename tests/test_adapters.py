@@ -1596,6 +1596,192 @@ class TestAalcAdapter(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# 计划任务归属时机（T-008 #4）                                                 #
+# --------------------------------------------------------------------------- #
+
+
+class _OrderTrackingMonitor(FakeProcessMonitor):
+    """记录 /Run、wait_for_process 调用顺序及 wait 时刻的归属标志值。"""
+
+    def __init__(self, flag_attr: str, holder: dict, order: list):
+        super().__init__()
+        self._flag_attr = flag_attr
+        self._holder = holder
+        self.order = order
+
+    def start_scheduled_task(self, name):
+        self.order.append(("run", None))
+        return super().start_scheduled_task(name)
+
+    def wait_for_process(self, name, timeout_s, stop_event=None, *, expected_path=None):
+        adapter = self._holder.get("adapter")
+        flag_value = getattr(adapter, self._flag_attr, None) if adapter else None
+        self.order.append(("wait", flag_value))
+        return super().wait_for_process(name, timeout_s, stop_event, expected_path=expected_path)
+
+
+class TestScheduledTaskOwnershipTiming(unittest.TestCase):
+    """T-008 #4：/Run 成功即登记计划任务归属。
+
+    覆盖：/Run 成功但等待无进程 → cleanup 恰好一次 /End；等待抛异常 →
+    同样恰好一次；/Run 失败 → 零 /End 且零标记；成功启动后清理 /End 不
+    重复；并以上升到 wait_for_process 时的标志值证明「标记先于等待」。
+    """
+
+    def _make(self, name: str, tmp: Path):
+        pm_holder: dict = {}
+        flag_attrs = {
+            "maa": "_scheduled_task_started",
+            "maaend": "_scheduled_helper_task_started",
+            "aalc": "_scheduled_helper_task_started",
+        }
+        order: list = []
+        pm = _OrderTrackingMonitor(flag_attrs[name], pm_holder, order)
+        if name == "maa":
+            cfg = _arknights_cfg(tmp, run_directly=True)
+            cfg["helper"].update({
+                "requires_administrator": True,
+                "scheduled_task_name": "DailyGames-MAA-Admin",
+                "scheduled_task_start_timeout_s": 3,
+            })
+            adapter = MaaAdapter(game_cfg=cfg, process_monitor=pm)
+            helper_name, task_name = "MAA.exe", "DailyGames-MAA-Admin"
+        elif name == "maaend":
+            cfg = _endfield_cfg(tmp)
+            cfg["helper"].update({
+                "requires_administrator": True,
+                "scheduled_task_name": "DailyGames-MaaEnd-Admin",
+                "scheduled_task_start_timeout_s": 3,
+            })
+            adapter = MaaEndAdapter(game_cfg=cfg, process_monitor=pm)
+            helper_name, task_name = "MaaEnd.exe", "DailyGames-MaaEnd-Admin"
+        else:
+            cfg = _limbus_cfg(tmp)
+            cfg["helper"].update({
+                "requires_administrator": True,
+                "scheduled_task_name": "DailyGames-AALC-Admin",
+                "scheduled_task_start_timeout_s": 3,
+            })
+            adapter = AalcAdapter(game_cfg=cfg, process_monitor=pm)
+            helper_name, task_name = "AALC.exe", "DailyGames-AALC-Admin"
+        pm_holder["adapter"] = adapter
+        return adapter, pm, helper_name, task_name, flag_attrs[name], order
+
+    def test_run_success_then_wait_timeout_cleanup_ends_task_exactly_once(self):
+        for name in ("maa", "maaend", "aalc"):
+            with self.subTest(adapter=name):
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    adapter, pm, helper_name, task_name, flag_attr, order = (
+                        self._make(name, tmp)
+                    )
+                    # 等待超时：计划任务已触发，但始终没有进程出现。
+                    result = adapter.start_helper()
+
+                    self.assertFalse(result.ok)
+                    self.assertEqual(result.code, CODE_START_FAILED)
+                    self.assertTrue(getattr(adapter, flag_attr))
+                    self.assertEqual(pm.started_scheduled_tasks, [task_name])
+
+                    cleanup = adapter.cleanup()
+
+                    self.assertTrue(cleanup.ok)
+                    self.assertEqual(pm.stopped_scheduled_tasks, [task_name])
+
+    def test_wait_process_exception_still_ends_task_exactly_once(self):
+        for name in ("maa", "maaend", "aalc"):
+            with self.subTest(adapter=name):
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    adapter, pm, helper_name, task_name, flag_attr, order = (
+                        self._make(name, tmp)
+                    )
+
+                    def _explode(*args, **kwargs):
+                        raise RuntimeError("wait_for_process exploded")
+
+                    pm.wait_for_process = _explode
+
+                    with self.assertRaises(RuntimeError):
+                        adapter.start_helper()
+
+                    # 标志在 /Run 之后、等待之前已登记：异常路径下 cleanup
+                    # 仍能精确 /End 本轮已触发的任务。
+                    self.assertTrue(getattr(adapter, flag_attr))
+                    cleanup = adapter.cleanup()
+                    self.assertTrue(cleanup.ok)
+                    self.assertEqual(pm.stopped_scheduled_tasks, [task_name])
+
+    def test_run_failure_never_marks_and_never_ends_task(self):
+        for name in ("maa", "maaend", "aalc"):
+            with self.subTest(adapter=name):
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    adapter, pm, helper_name, task_name, flag_attr, order = (
+                        self._make(name, tmp)
+                    )
+                    pm.start_scheduled_task_result = False
+
+                    result = adapter.start_helper()
+
+                    self.assertFalse(result.ok)
+                    self.assertEqual(result.code, CODE_START_FAILED)
+                    self.assertFalse(getattr(adapter, flag_attr))
+                    self.assertEqual(pm.started_scheduled_tasks, [task_name])
+                    cleanup = adapter.cleanup()
+                    self.assertTrue(cleanup.ok)
+                    self.assertEqual(pm.stopped_scheduled_tasks, [])
+                    self.assertEqual(pm.terminated, [])
+
+    def test_successful_start_cleanup_ends_task_exactly_once(self):
+        for name in ("maa", "maaend", "aalc"):
+            with self.subTest(adapter=name):
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    adapter, pm, helper_name, task_name, flag_attr, order = (
+                        self._make(name, tmp)
+                    )
+                    pm.set_wait_process(helper_name, [ProcessRecord(
+                        pid=820,
+                        executable=helper_name,
+                        full_path="C:\\elevated.exe",
+                        owned=False,
+                        create_time=0.0,
+                    )])
+
+                    result = adapter.start_helper()
+
+                    self.assertTrue(result.ok)
+                    self.assertTrue(getattr(adapter, flag_attr))
+                    cleanup = adapter.cleanup()
+                    self.assertTrue(cleanup.ok)
+                    self.assertEqual(pm.stopped_scheduled_tasks, [task_name])
+
+    def test_task_started_flag_is_registered_before_wait_for_process(self):
+        for name in ("maa", "maaend", "aalc"):
+            with self.subTest(adapter=name):
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    adapter, pm, helper_name, task_name, flag_attr, order = (
+                        self._make(name, tmp)
+                    )
+                    pm.set_wait_process(helper_name, [ProcessRecord(
+                        pid=821,
+                        executable=helper_name,
+                        full_path="C:\\elevated.exe",
+                        owned=False,
+                        create_time=0.0,
+                    )])
+
+                    result = adapter.start_helper()
+
+                    self.assertTrue(result.ok)
+                    # wait_for_process 入口处读到的标志已为 True：标记发生在
+                    # /Run 之后、等待之前。
+                    self.assertEqual(order, [("run", None), ("wait", True)])
+
+
+# --------------------------------------------------------------------------- #
 # StepResult 不可变                                                            #
 # --------------------------------------------------------------------------- #
 
