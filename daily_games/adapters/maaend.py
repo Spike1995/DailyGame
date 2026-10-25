@@ -736,7 +736,11 @@ class MaaEndAdapter(AdapterBase):
             return StepResult(
                 False,
                 CODE_TASK_ABORTED,
-                "MaaEnd 场景检查中止了整个任务链；常见原因是 HDR 或显卡滤镜未关闭",
+                (
+                    "MaaEnd 场景检查中止了整个任务链，无法确认游戏已进入主场景；"
+                    "请检查游戏内资源更新、HDR/滤镜及助手识别条件，"
+                    "完成处理后关闭相关程序再重试"
+                ),
                 details,
             )
         if len(started) < expected_count:

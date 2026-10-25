@@ -562,7 +562,10 @@ class MaaAdapter(AdapterBase):
                 return StepResult(
                     False,
                     CODE_WAIT_TIMEOUT,
-                    "等待明日方舟与 MAA 全部退出超时",
+                    (
+                        "等待明日方舟与 MAA 全部退出超时；"
+                        "若游戏正在下载资源更新，请等更新完成后重试"
+                    ),
                     {
                         "timeout_s": timeout_s,
                         "running_processes": sorted(set(running_names)),
